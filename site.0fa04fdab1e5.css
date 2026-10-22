@@ -1,0 +1,82 @@
+:root {
+  --library-navy: #17314f;
+  --library-blue: #284f79;
+  --library-gold: #edbd74;
+  --library-paper: #f6f7f5;
+}
+
+body {
+  background: var(--library-paper);
+  color: #1f2d3d;
+}
+
+.library-nav {
+  background: var(--library-navy);
+}
+
+.catalog-hero {
+  color: #fff;
+  background: linear-gradient(120deg, var(--library-navy), var(--library-blue));
+}
+
+.catalog-hero .eyebrow,
+.eyebrow {
+  color: var(--library-gold);
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+}
+
+.catalog-hero .form-control {
+  min-width: 0;
+}
+
+.book-cover {
+  height: 230px;
+  object-fit: cover;
+  background: #e9edf1;
+}
+
+.cover-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .6rem;
+  color: var(--library-blue);
+  background: linear-gradient(145deg, #e3e9ec, #f5e8d2);
+}
+
+.cover-placeholder span {
+  font-size: 3.5rem;
+}
+
+.cover-placeholder small {
+  color: #536576;
+  font-weight: 600;
+}
+
+.empty-state {
+  border: 1px dashed #cbd3dc;
+  border-radius: .75rem;
+  padding: 2rem;
+  text-align: center;
+  color: #637181;
+  background: #fff;
+}
+
+.form-control:focus,
+.form-select:focus {
+  border-color: #7193b4;
+  box-shadow: 0 0 0 .2rem rgb(40 79 121 / 15%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .book-card {
+    transition: transform .15s ease, opacity .15s ease;
+  }
+
+  .book-card:hover {
+    transform: translateY(-3px);
+  }
+}

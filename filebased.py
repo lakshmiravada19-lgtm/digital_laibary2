@@ -1,66 +1,169 @@
-"""Email backend that writes messages to a file."""
+"File-based cache backend"
 
-import datetime
+import glob
 import os
+import pickle
+import random
+import tempfile
+import time
+import zlib
+from hashlib import md5
 
-from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
-from django.core.mail.backends.console import EmailBackend as ConsoleEmailBackend
+from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
+from django.core.files import locks
+from django.core.files.move import file_move_safe
+from django.utils._os import safe_makedirs
 
 
-class EmailBackend(ConsoleEmailBackend):
-    def __init__(self, *args, file_path=None, **kwargs):
-        self._fname = None
-        if file_path is not None:
-            self.file_path = file_path
-        else:
-            self.file_path = getattr(settings, "EMAIL_FILE_PATH", None)
-        self.file_path = os.path.abspath(self.file_path)
+class FileBasedCache(BaseCache):
+    cache_suffix = ".djcache"
+    pickle_protocol = pickle.HIGHEST_PROTOCOL
+
+    def __init__(self, dir, params):
+        super().__init__(params)
+        self._dir = os.path.abspath(dir)
+        self._createdir()
+
+    def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        if self.has_key(key, version):
+            return False
+        self.set(key, value, timeout, version)
+        return True
+
+    def get(self, key, default=None, version=None):
+        fname = self._key_to_file(key, version)
         try:
-            os.makedirs(self.file_path, exist_ok=True)
-        except FileExistsError:
-            raise ImproperlyConfigured(
-                "Path for saving email messages exists, but is not a directory: %s"
-                % self.file_path
-            )
-        except OSError as err:
-            raise ImproperlyConfigured(
-                "Could not create directory for saving email messages: %s (%s)"
-                % (self.file_path, err)
-            )
-        # Make sure that self.file_path is writable.
-        if not os.access(self.file_path, os.W_OK):
-            raise ImproperlyConfigured(
-                "Could not write to directory: %s" % self.file_path
-            )
-        # Finally, call super().
-        # Since we're using the console-based backend as a base,
-        # force the stream to be None, so we don't default to stdout
-        kwargs["stream"] = None
-        super().__init__(*args, **kwargs)
+            with open(fname, "rb") as f:
+                if not self._is_expired(f):
+                    return pickle.loads(zlib.decompress(f.read()))
+        except FileNotFoundError:
+            pass
+        return default
 
-    def write_message(self, message):
-        self.stream.write(message.message().as_bytes() + b"\n")
-        self.stream.write(b"-" * 79)
-        self.stream.write(b"\n")
+    def _write_content(self, file, timeout, value):
+        expiry = self.get_backend_timeout(timeout)
+        file.write(pickle.dumps(expiry, self.pickle_protocol))
+        file.write(zlib.compress(pickle.dumps(value, self.pickle_protocol)))
 
-    def _get_filename(self):
-        """Return a unique file name."""
-        if self._fname is None:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            fname = "%s-%s.log" % (timestamp, abs(id(self)))
-            self._fname = os.path.join(self.file_path, fname)
-        return self._fname
+    def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        self._createdir()  # Cache dir can be deleted at any time.
+        fname = self._key_to_file(key, version)
+        self._cull()  # make some room if necessary
+        fd, tmp_path = tempfile.mkstemp(dir=self._dir)
+        renamed = False
+        try:
+            with open(fd, "wb") as f:
+                self._write_content(f, timeout, value)
+            file_move_safe(tmp_path, fname, allow_overwrite=True)
+            renamed = True
+        finally:
+            if not renamed:
+                os.remove(tmp_path)
 
-    def open(self):
-        if self.stream is None:
-            self.stream = open(self._get_filename(), "ab")
+    def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
+        try:
+            with open(self._key_to_file(key, version), "r+b") as f:
+                try:
+                    locks.lock(f, locks.LOCK_EX)
+                    if self._is_expired(f):
+                        return False
+                    else:
+                        previous_value = pickle.loads(zlib.decompress(f.read()))
+                        f.seek(0)
+                        self._write_content(f, timeout, previous_value)
+                        return True
+                finally:
+                    locks.unlock(f)
+        except FileNotFoundError:
+            return False
+
+    def delete(self, key, version=None):
+        return self._delete(self._key_to_file(key, version))
+
+    def _delete(self, fname):
+        if not fname.startswith(self._dir) or not os.path.exists(fname):
+            return False
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            # The file may have been removed by another process.
+            return False
+        return True
+
+    def has_key(self, key, version=None):
+        fname = self._key_to_file(key, version)
+        try:
+            with open(fname, "rb") as f:
+                return not self._is_expired(f)
+        except FileNotFoundError:
+            return False
+
+    def _cull(self):
+        """
+        Remove random cache entries if max_entries is reached at a ratio
+        of num_entries / cull_frequency. A value of 0 for CULL_FREQUENCY means
+        that the entire cache will be purged.
+        """
+        filelist = self._list_cache_files()
+        num_entries = len(filelist)
+        if num_entries < self._max_entries:
+            return  # return early if no culling is required
+        if self._cull_frequency == 0:
+            return self.clear()  # Clear the cache when CULL_FREQUENCY = 0
+        # Delete a random selection of entries
+        filelist = random.sample(filelist, int(num_entries / self._cull_frequency))
+        for fname in filelist:
+            self._delete(fname)
+
+    def _createdir(self):
+        # Workaround because os.makedirs() doesn't apply the "mode" argument
+        # to intermediate-level directories.
+        # https://github.com/python/cpython/issues/86533
+        safe_makedirs(self._dir, mode=0o700, exist_ok=True)
+
+    def _key_to_file(self, key, version=None):
+        """
+        Convert a key into a cache file path. Basically this is the
+        root cache path joined with the md5sum of the key and a suffix.
+        """
+        key = self.make_and_validate_key(key, version=version)
+        return os.path.join(
+            self._dir,
+            "".join(
+                [
+                    md5(key.encode(), usedforsecurity=False).hexdigest(),
+                    self.cache_suffix,
+                ]
+            ),
+        )
+
+    def clear(self):
+        """
+        Remove all the cache files.
+        """
+        for fname in self._list_cache_files():
+            self._delete(fname)
+
+    def _is_expired(self, f):
+        """
+        Take an open cache file `f` and delete it if it's expired.
+        """
+        try:
+            exp = pickle.load(f)
+        except EOFError:
+            exp = 0  # An empty file is considered expired.
+        if exp is not None and exp < time.time():
+            f.close()  # On Windows a file has to be closed before deleting
+            self._delete(f.name)
             return True
         return False
 
-    def close(self):
-        try:
-            if self.stream is not None:
-                self.stream.close()
-        finally:
-            self.stream = None
+    def _list_cache_files(self):
+        """
+        Get a list of paths to all the cache files. These are all the files
+        in the root cache dir that end on the cache_suffix.
+        """
+        return [
+            os.path.join(self._dir, fname)
+            for fname in glob.glob(f"*{self.cache_suffix}", root_dir=self._dir)
+        ]

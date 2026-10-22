@@ -1,14 +1,19 @@
-from django.contrib import admin
-from django.contrib.auth import views as auth_views
-from django.urls import include, path
+from django.conf import settings
+from django.conf.urls.static import static
+from django.contrib.staticfiles.views import serve
 
-urlpatterns = [
-    path("admin/", admin.site.urls),
-    path(
-        "accounts/login/",
-        auth_views.LoginView.as_view(template_name="registration/login.html"),
-        name="login",
-    ),
-    path("accounts/logout/", auth_views.LogoutView.as_view(), name="logout"),
-    path("", include("library.urls")),
-]
+urlpatterns = []
+
+
+def staticfiles_urlpatterns(prefix=None):
+    """
+    Helper function to return a URL pattern for serving static files.
+    """
+    if prefix is None:
+        prefix = settings.STATIC_URL
+    return static(prefix, view=serve)
+
+
+# Only append if urlpatterns are empty
+if settings.DEBUG and not urlpatterns:
+    urlpatterns += staticfiles_urlpatterns()

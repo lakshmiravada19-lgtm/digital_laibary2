@@ -1,35 +1,71 @@
-from django.contrib.sessions.base_session import AbstractBaseSession, BaseSessionManager
+"""
+The GeometryColumns and SpatialRefSys models for the SpatiaLite backend.
+"""
+
+from django.contrib.gis.db.backends.base.models import SpatialRefSysMixin
+from django.db import models
 
 
-class SessionManager(BaseSessionManager):
-    use_in_migrations = True
-
-
-class Session(AbstractBaseSession):
+class SpatialiteGeometryColumns(models.Model):
     """
-    Django provides full support for anonymous sessions. The session
-    framework lets you store and retrieve arbitrary data on a
-    per-site-visitor basis. It stores data on the server side and
-    abstracts the sending and receiving of cookies. Cookies contain a
-    session ID -- not the data itself.
-
-    The Django sessions framework is entirely cookie-based. It does
-    not fall back to putting session IDs in URLs. This is an intentional
-    design decision. Not only does that behavior make URLs ugly, it makes
-    your site vulnerable to session-ID theft via the "Referer" header.
-
-    For complete documentation on using Sessions in your code, consult
-    the sessions documentation that is shipped with Django (also available
-    on the Django web site).
+    The 'geometry_columns' table from SpatiaLite.
     """
 
-    objects = SessionManager()
+    f_table_name = models.CharField(max_length=256)
+    f_geometry_column = models.CharField(max_length=256)
+    coord_dimension = models.IntegerField()
+    srid = models.IntegerField(primary_key=True)
+    spatial_index_enabled = models.IntegerField()
+    type = models.IntegerField(db_column="geometry_type")
+
+    class Meta:
+        app_label = "gis"
+        db_table = "geometry_columns"
+        managed = False
+
+    def __str__(self):
+        return "%s.%s - %dD %s field (SRID: %d)" % (
+            self.f_table_name,
+            self.f_geometry_column,
+            self.coord_dimension,
+            self.type,
+            self.srid,
+        )
 
     @classmethod
-    def get_session_store_class(cls):
-        from django.contrib.sessions.backends.db import SessionStore
+    def table_name_col(cls):
+        """
+        Return the name of the metadata column used to store the feature table
+        name.
+        """
+        return "f_table_name"
 
-        return SessionStore
+    @classmethod
+    def geom_col_name(cls):
+        """
+        Return the name of the metadata column used to store the feature
+        geometry column.
+        """
+        return "f_geometry_column"
 
-    class Meta(AbstractBaseSession.Meta):
-        db_table = "django_session"
+
+class SpatialiteSpatialRefSys(models.Model, SpatialRefSysMixin):
+    """
+    The 'spatial_ref_sys' table from SpatiaLite.
+    """
+
+    srid = models.IntegerField(primary_key=True)
+    auth_name = models.CharField(max_length=256)
+    auth_srid = models.IntegerField()
+    ref_sys_name = models.CharField(max_length=256)
+    proj4text = models.CharField(max_length=2048)
+    srtext = models.CharField(max_length=2048)
+
+    class Meta:
+        app_label = "gis"
+        db_table = "spatial_ref_sys"
+        managed = False
+
+    @property
+    def wkt(self):
+        return self.srtext

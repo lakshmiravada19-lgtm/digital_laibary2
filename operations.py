@@ -1,349 +1,234 @@
-from django.contrib.postgres.signals import (
-    get_citext_oids,
-    get_hstore_oids,
-    register_type_handlers,
-)
-from django.db import NotSupportedError, router
-from django.db.migrations import AddConstraint, AddIndex, RemoveIndex
-from django.db.migrations.operations.base import Operation, OperationCategory
-from django.db.models.constraints import CheckConstraint
+"""
+SQL functions reference lists:
+https://www.gaia-gis.it/gaia-sins/spatialite-sql-4.3.0.html
+"""
+
+from django.contrib.gis.db import models
+from django.contrib.gis.db.backends.base.operations import BaseSpatialOperations
+from django.contrib.gis.db.backends.spatialite.adapter import SpatiaLiteAdapter
+from django.contrib.gis.db.backends.utils import SpatialOperator
+from django.contrib.gis.geos.geometry import GEOSGeometry, GEOSGeometryBase
+from django.contrib.gis.geos.prototypes.io import wkb_r
+from django.contrib.gis.measure import Distance
+from django.core.exceptions import ImproperlyConfigured
+from django.db.backends.sqlite3.operations import DatabaseOperations
+from django.utils.functional import cached_property
+from django.utils.version import get_version_tuple
 
 
-class CreateExtension(Operation):
-    reversible = True
-    category = OperationCategory.ADDITION
-
-    def __init__(self, name):
-        self.name = name
-
-    def state_forwards(self, app_label, state):
-        pass
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        if schema_editor.connection.vendor != "postgresql" or not router.allow_migrate(
-            schema_editor.connection.alias, app_label
-        ):
-            return
-        if not self.extension_exists(schema_editor, self.name):
-            schema_editor.execute(
-                "CREATE EXTENSION IF NOT EXISTS %s"
-                % schema_editor.quote_name(self.name)
-            )
-        # Clear cached, stale oids.
-        get_hstore_oids.cache_clear()
-        get_citext_oids.cache_clear()
-        # Registering new type handlers cannot be done before the extension is
-        # installed, otherwise a subsequent data migration would use the same
-        # connection.
-        register_type_handlers(schema_editor.connection)
-        if hasattr(schema_editor.connection, "register_geometry_adapters"):
-            schema_editor.connection.register_geometry_adapters(
-                schema_editor.connection.connection, True
-            )
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        if not router.allow_migrate(schema_editor.connection.alias, app_label):
-            return
-        if self.extension_exists(schema_editor, self.name):
-            schema_editor.execute(
-                "DROP EXTENSION IF EXISTS %s" % schema_editor.quote_name(self.name)
-            )
-        # Clear cached, stale oids.
-        get_hstore_oids.cache_clear()
-        get_citext_oids.cache_clear()
-
-    def extension_exists(self, schema_editor, extension):
-        with schema_editor.connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT 1 FROM pg_extension WHERE extname = %s",
-                [extension],
-            )
-            return bool(cursor.fetchone())
-
-    def describe(self):
-        return "Creates extension %s" % self.name
-
-    @property
-    def migration_name_fragment(self):
-        return "create_extension_%s" % self.name
+class SpatialiteNullCheckOperator(SpatialOperator):
+    def as_sql(self, connection, lookup, template_params, sql_params):
+        sql, params = super().as_sql(connection, lookup, template_params, sql_params)
+        return "%s > 0" % sql, params
 
 
-class BloomExtension(CreateExtension):
-    def __init__(self):
-        self.name = "bloom"
+class SpatiaLiteOperations(BaseSpatialOperations, DatabaseOperations):
+    name = "spatialite"
+    spatialite = True
 
+    Adapter = SpatiaLiteAdapter
 
-class BtreeGinExtension(CreateExtension):
-    def __init__(self):
-        self.name = "btree_gin"
+    collect = "Collect"
+    extent = "Extent"
+    makeline = "MakeLine"
+    unionagg = "GUnion"
 
+    from_text = "GeomFromText"
 
-class BtreeGistExtension(CreateExtension):
-    def __init__(self):
-        self.name = "btree_gist"
+    gis_operators = {
+        # Binary predicates
+        "equals": SpatialiteNullCheckOperator(func="Equals"),
+        "disjoint": SpatialiteNullCheckOperator(func="Disjoint"),
+        "touches": SpatialiteNullCheckOperator(func="Touches"),
+        "crosses": SpatialiteNullCheckOperator(func="Crosses"),
+        "within": SpatialiteNullCheckOperator(func="Within"),
+        "overlaps": SpatialiteNullCheckOperator(func="Overlaps"),
+        "contains": SpatialiteNullCheckOperator(func="Contains"),
+        "intersects": SpatialiteNullCheckOperator(func="Intersects"),
+        "relate": SpatialiteNullCheckOperator(func="Relate"),
+        "coveredby": SpatialiteNullCheckOperator(func="CoveredBy"),
+        "covers": SpatialiteNullCheckOperator(func="Covers"),
+        # Returns true if B's bounding box completely contains A's bounding box.
+        "contained": SpatialOperator(func="MbrWithin"),
+        # Returns true if A's bounding box completely contains B's bounding box.
+        "bbcontains": SpatialOperator(func="MbrContains"),
+        # Returns true if A's bounding box overlaps B's bounding box.
+        "bboverlaps": SpatialOperator(func="MbrOverlaps"),
+        # These are implemented here as synonyms for Equals
+        "same_as": SpatialiteNullCheckOperator(func="Equals"),
+        "exact": SpatialiteNullCheckOperator(func="Equals"),
+        # Distance predicates
+        "dwithin": SpatialOperator(func="PtDistWithin"),
+    }
 
+    disallowed_aggregates = (models.Extent3D,)
 
-class CITextExtension(CreateExtension):
-    def __init__(self):
-        self.name = "citext"
+    select = "CAST (AsEWKB(%s) AS BLOB)"
 
+    function_names = {
+        "AsWKB": "St_AsBinary",
+        "BoundingCircle": "GEOSMinimumBoundingCircle",
+        "ForcePolygonCW": "ST_ForceLHR",
+        "FromWKB": "ST_GeomFromWKB",
+        "FromWKT": "ST_GeomFromText",
+        "Length": "ST_Length",
+        "LineLocatePoint": "ST_Line_Locate_Point",
+        "NumPoints": "ST_NPoints",
+        "Reverse": "ST_Reverse",
+        "Scale": "ScaleCoords",
+        "Translate": "ST_Translate",
+        "Union": "ST_Union",
+    }
 
-class CryptoExtension(CreateExtension):
-    def __init__(self):
-        self.name = "pgcrypto"
+    @cached_property
+    def unsupported_functions(self):
+        unsupported = {"GeometryDistance", "IsEmpty", "MemSize"}
+        if not self.geom_lib_version():
+            unsupported |= {"Azimuth", "GeoHash", "MakeValid"}
+        if self.spatial_version < (5, 1):
+            unsupported |= {"BoundingCircle"}
+        return unsupported
 
+    @cached_property
+    def spatial_version(self):
+        """Determine the version of the SpatiaLite library."""
+        try:
+            version = self.spatialite_version_tuple()[1:]
+        except Exception as exc:
+            raise ImproperlyConfigured(
+                'Cannot determine the SpatiaLite version for the "%s" database. '
+                "Was the SpatiaLite initialization SQL loaded on this database?"
+                % (self.connection.settings_dict["NAME"],)
+            ) from exc
+        if version < (4, 3, 0):
+            raise ImproperlyConfigured("GeoDjango supports SpatiaLite 4.3.0 and above.")
+        return version
 
-class HStoreExtension(CreateExtension):
-    def __init__(self):
-        self.name = "hstore"
+    def convert_extent(self, box):
+        """
+        Convert the polygon data received from SpatiaLite to min/max values.
+        """
+        if box is None:
+            return None
+        shell = GEOSGeometry(box).shell
+        xmin, ymin = shell[0][:2]
+        xmax, ymax = shell[2][:2]
+        return (xmin, ymin, xmax, ymax)
 
+    def geo_db_type(self, f):
+        """
+        Return None because geometry columns are added via the
+        `AddGeometryColumn` stored procedure on SpatiaLite.
+        """
+        return None
 
-class TrigramExtension(CreateExtension):
-    def __init__(self):
-        self.name = "pg_trgm"
-
-
-class UnaccentExtension(CreateExtension):
-    def __init__(self):
-        self.name = "unaccent"
-
-
-class NotInTransactionMixin:
-    def _ensure_not_in_transaction(self, schema_editor):
-        if schema_editor.connection.in_atomic_block:
-            raise NotSupportedError(
-                "The %s operation cannot be executed inside a transaction "
-                "(set atomic = False on the migration)." % self.__class__.__name__
-            )
-
-
-class AddIndexConcurrently(NotInTransactionMixin, AddIndex):
-    """Create an index using PostgreSQL's CREATE INDEX CONCURRENTLY syntax."""
-
-    atomic = False
-    category = OperationCategory.ADDITION
-
-    def describe(self):
-        return "Concurrently create index %s on field(s) %s of model %s" % (
-            self.index.name,
-            ", ".join(self.index.fields),
-            self.model_name,
-        )
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        self._ensure_not_in_transaction(schema_editor)
-        model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, model):
-            schema_editor.add_index(model, self.index, concurrently=True)
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        self._ensure_not_in_transaction(schema_editor)
-        model = from_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, model):
-            schema_editor.remove_index(model, self.index, concurrently=True)
-
-
-class RemoveIndexConcurrently(NotInTransactionMixin, RemoveIndex):
-    """Remove an index using PostgreSQL's DROP INDEX CONCURRENTLY syntax."""
-
-    atomic = False
-    category = OperationCategory.REMOVAL
-
-    def describe(self):
-        return "Concurrently remove index %s from %s" % (self.name, self.model_name)
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        self._ensure_not_in_transaction(schema_editor)
-        model = from_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, model):
-            from_model_state = from_state.models[app_label, self.model_name_lower]
-            index = from_model_state.get_index_by_name(self.name)
-            schema_editor.remove_index(model, index, concurrently=True)
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        self._ensure_not_in_transaction(schema_editor)
-        model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, model):
-            to_model_state = to_state.models[app_label, self.model_name_lower]
-            index = to_model_state.get_index_by_name(self.name)
-            schema_editor.add_index(model, index, concurrently=True)
-
-
-class CollationOperation(Operation):
-    def __init__(self, name, locale, *, provider="libc", deterministic=True):
-        self.name = name
-        self.locale = locale
-        self.provider = provider
-        self.deterministic = deterministic
-
-    def state_forwards(self, app_label, state):
-        pass
-
-    def deconstruct(self):
-        kwargs = {"name": self.name, "locale": self.locale}
-        if self.provider and self.provider != "libc":
-            kwargs["provider"] = self.provider
-        if self.deterministic is False:
-            kwargs["deterministic"] = self.deterministic
-        return (
-            self.__class__.__qualname__,
-            [],
-            kwargs,
-        )
-
-    def create_collation(self, schema_editor):
-        args = {"locale": schema_editor.quote_name(self.locale)}
-        if self.provider != "libc":
-            args["provider"] = schema_editor.quote_name(self.provider)
-        if self.deterministic is False:
-            args["deterministic"] = "false"
-        schema_editor.execute(
-            "CREATE COLLATION %(name)s (%(args)s)"
-            % {
-                "name": schema_editor.quote_name(self.name),
-                "args": ", ".join(
-                    f"{option}={value}" for option, value in args.items()
-                ),
-            }
-        )
-
-    def remove_collation(self, schema_editor):
-        schema_editor.execute(
-            "DROP COLLATION %s" % schema_editor.quote_name(self.name),
-        )
-
-
-class CreateCollation(CollationOperation):
-    """Create a collation."""
-
-    category = OperationCategory.ADDITION
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        if schema_editor.connection.vendor != "postgresql" or not router.allow_migrate(
-            schema_editor.connection.alias, app_label
-        ):
-            return
-        self.create_collation(schema_editor)
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        if not router.allow_migrate(schema_editor.connection.alias, app_label):
-            return
-        self.remove_collation(schema_editor)
-
-    def describe(self):
-        return f"Create collation {self.name}"
-
-    @property
-    def migration_name_fragment(self):
-        return "create_collation_%s" % self.name.lower()
-
-    def reduce(self, operation, app_label):
-        if isinstance(operation, RemoveCollation) and self.name == operation.name:
+    def get_distance(self, f, value, lookup_type):
+        """
+        Return the distance parameters for the given geometry field,
+        lookup value, and lookup type.
+        """
+        if not value:
             return []
-        return super().reduce(operation, app_label)
-
-
-class RemoveCollation(CollationOperation):
-    """Remove a collation."""
-
-    category = OperationCategory.REMOVAL
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        if schema_editor.connection.vendor != "postgresql" or not router.allow_migrate(
-            schema_editor.connection.alias, app_label
-        ):
-            return
-        self.remove_collation(schema_editor)
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        if not router.allow_migrate(schema_editor.connection.alias, app_label):
-            return
-        self.create_collation(schema_editor)
-
-    def describe(self):
-        return f"Remove collation {self.name}"
-
-    @property
-    def migration_name_fragment(self):
-        return "remove_collation_%s" % self.name.lower()
-
-
-class AddConstraintNotValid(AddConstraint):
-    """
-    Add a table constraint without enforcing validation, using PostgreSQL's
-    NOT VALID syntax.
-    """
-
-    category = OperationCategory.ADDITION
-
-    def __init__(self, model_name, constraint):
-        if not isinstance(constraint, CheckConstraint):
-            raise TypeError(
-                "AddConstraintNotValid.constraint must be a check constraint."
-            )
-        super().__init__(model_name, constraint)
-
-    def describe(self):
-        return "Create not valid constraint %s on model %s" % (
-            self.constraint.name,
-            self.model_name,
-        )
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        model = from_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, model):
-            constraint_sql = self.constraint.create_sql(model, schema_editor)
-            if constraint_sql:
-                # Constraint.create_sql returns interpolated SQL which makes
-                # params=None a necessity to avoid escaping attempts on
-                # execution.
-                schema_editor.execute(str(constraint_sql) + " NOT VALID", params=None)
-
-    @property
-    def migration_name_fragment(self):
-        return super().migration_name_fragment + "_not_valid"
-
-
-class ValidateConstraint(Operation):
-    """Validate a table NOT VALID constraint."""
-
-    category = OperationCategory.ALTERATION
-
-    def __init__(self, model_name, name):
-        self.model_name = model_name
-        self.name = name
-
-    def describe(self):
-        return "Validate constraint %s on model %s" % (self.name, self.model_name)
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        model = from_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, model):
-            schema_editor.execute(
-                "ALTER TABLE %s VALIDATE CONSTRAINT %s"
-                % (
-                    schema_editor.quote_name(model._meta.db_table),
-                    schema_editor.quote_name(self.name),
+        value = value[0]
+        if isinstance(value, Distance):
+            if f.geodetic(self.connection):
+                if lookup_type == "dwithin":
+                    raise ValueError(
+                        "Only numeric values of degree units are allowed on "
+                        "geographic DWithin queries."
+                    )
+                dist_param = value.m
+            else:
+                dist_param = getattr(
+                    value, Distance.unit_attname(f.units_name(self.connection))
                 )
-            )
+        else:
+            dist_param = value
+        return [dist_param]
 
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        # PostgreSQL does not provide a way to make a constraint invalid.
-        pass
+    def _get_spatialite_func(self, func):
+        """
+        Helper routine for calling SpatiaLite functions and returning
+        their result.
+        Any error occurring in this method should be handled by the caller.
+        """
+        cursor = self.connection._cursor()
+        try:
+            cursor.execute("SELECT %s" % func)
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+        return row[0]
 
-    def state_forwards(self, app_label, state):
-        pass
+    def geos_version(self):
+        "Return the version of GEOS used by SpatiaLite as a string."
+        return self._get_spatialite_func("geos_version()")
 
-    @property
-    def migration_name_fragment(self):
-        return "%s_validate_%s" % (self.model_name.lower(), self.name.lower())
+    def proj_version(self):
+        """Return the version of the PROJ library used by SpatiaLite."""
+        return self._get_spatialite_func("proj4_version()")
 
-    def deconstruct(self):
-        return (
-            self.__class__.__name__,
-            [],
-            {
-                "model_name": self.model_name,
-                "name": self.name,
-            },
+    def lwgeom_version(self):
+        """Return the version of LWGEOM library used by SpatiaLite."""
+        return self._get_spatialite_func("lwgeom_version()")
+
+    def rttopo_version(self):
+        """Return the version of RTTOPO library used by SpatiaLite."""
+        return self._get_spatialite_func("rttopo_version()")
+
+    def geom_lib_version(self):
+        """
+        Return the version of the version-dependant geom library used by
+        SpatiaLite.
+        """
+        if self.spatial_version >= (5,):
+            return self.rttopo_version()
+        else:
+            return self.lwgeom_version()
+
+    def spatialite_version(self):
+        "Return the SpatiaLite library version as a string."
+        return self._get_spatialite_func("spatialite_version()")
+
+    def spatialite_version_tuple(self):
+        """
+        Return the SpatiaLite version as a tuple (version string, major,
+        minor, subminor).
+        """
+        version = self.spatialite_version()
+        return (version,) + get_version_tuple(version)
+
+    def spatial_aggregate_name(self, agg_name):
+        """
+        Return the spatial aggregate SQL template and function for the
+        given Aggregate instance.
+        """
+        agg_name = "unionagg" if agg_name.lower() == "union" else agg_name.lower()
+        return getattr(self, agg_name)
+
+    # Routines for getting the OGC-compliant models.
+    def geometry_columns(self):
+        from django.contrib.gis.db.backends.spatialite.models import (
+            SpatialiteGeometryColumns,
         )
+
+        return SpatialiteGeometryColumns
+
+    def spatial_ref_sys(self):
+        from django.contrib.gis.db.backends.spatialite.models import (
+            SpatialiteSpatialRefSys,
+        )
+
+        return SpatialiteSpatialRefSys
+
+    def get_geometry_converter(self, expression):
+        geom_class = expression.output_field.geom_class
+        read = wkb_r().read
+
+        def converter(value, expression, connection):
+            if value is not None:
+                return GEOSGeometryBase(
+                    read(value, max_geom_collections=None), geom_class
+                )
+
+        return converter

@@ -1,345 +1,238 @@
-import copy
-from collections.abc import Mapping
+"""
+Useful auxiliary data structures for query construction. Not useful outside
+the SQL domain.
+"""
+
+import warnings
+
+from django.core.exceptions import FullResultSet
+from django.db.models.sql.constants import INNER, LOUTER
+from django.utils.deprecation import RemovedInDjango60Warning
 
 
-class OrderedSet:
+class MultiJoin(Exception):
     """
-    A set which keeps the ordering of the inserted items.
+    Used by join construction code to indicate the point at which a
+    multi-valued join was attempted (if the caller wants to treat that
+    exceptionally).
     """
 
-    def __init__(self, iterable=None):
-        self.dict = dict.fromkeys(iterable or ())
-
-    def add(self, item):
-        self.dict[item] = None
-
-    def remove(self, item):
-        del self.dict[item]
-
-    def discard(self, item):
-        try:
-            self.remove(item)
-        except KeyError:
-            pass
-
-    def __iter__(self):
-        return iter(self.dict)
-
-    def __reversed__(self):
-        return reversed(self.dict)
-
-    def __contains__(self, item):
-        return item in self.dict
-
-    def __bool__(self):
-        return bool(self.dict)
-
-    def __len__(self):
-        return len(self.dict)
-
-    def __repr__(self):
-        data = repr(list(self.dict)) if self.dict else ""
-        return f"{self.__class__.__qualname__}({data})"
+    def __init__(self, names_pos, path_with_names):
+        self.level = names_pos
+        # The path travelled, this includes the path to the multijoin.
+        self.names_with_path = path_with_names
 
 
-class MultiValueDictKeyError(KeyError):
+class Empty:
     pass
 
 
-class MultiValueDict(dict):
+class Join:
     """
-    A subclass of dictionary customized to handle multiple values for the
-    same key.
+    Used by sql.Query and sql.SQLCompiler to generate JOIN clauses into the
+    FROM entry. For example, the SQL generated could be
+        LEFT OUTER JOIN "sometable" T1
+        ON ("othertable"."sometable_id" = "sometable"."id")
 
-    >>> d = MultiValueDict({'name': ['Adrian', 'Simon'], 'position': ['Developer']})
-    >>> d['name']
-    'Simon'
-    >>> d.getlist('name')
-    ['Adrian', 'Simon']
-    >>> d.getlist('doesnotexist')
-    []
-    >>> d.getlist('doesnotexist', ['Adrian', 'Simon'])
-    ['Adrian', 'Simon']
-    >>> d.get('lastname', 'nonexistent')
-    'nonexistent'
-    >>> d.setlist('lastname', ['Holovaty', 'Willison'])
-
-    This class exists to solve the irritating problem raised by cgi.parse_qs,
-    which returns a list for every key, even though most web forms submit
-    single name-value pairs.
+    This class is primarily used in Query.alias_map. All entries in alias_map
+    must be Join compatible by providing the following attributes and methods:
+        - table_name (string)
+        - table_alias (possible alias for the table, can be None)
+        - join_type (can be None for those entries that aren't joined from
+          anything)
+        - parent_alias (which table is this join's parent, can be None similarly
+          to join_type)
+        - as_sql()
+        - relabeled_clone()
     """
 
-    def __init__(self, key_to_list_mapping=()):
-        super().__init__(key_to_list_mapping)
-
-    def __repr__(self):
-        return "<%s: %s>" % (self.__class__.__name__, super().__repr__())
-
-    def __getitem__(self, key):
-        """
-        Return the last data value for this key, or [] if it's an empty list;
-        raise KeyError if not found.
-        """
-        try:
-            list_ = super().__getitem__(key)
-        except KeyError:
-            raise MultiValueDictKeyError(key)
-        try:
-            return list_[-1]
-        except IndexError:
-            return []
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, [value])
-
-    def __copy__(self):
-        return self.__class__([(k, v[:]) for k, v in self.lists()])
-
-    def __deepcopy__(self, memo):
-        result = self.__class__()
-        memo[id(self)] = result
-        for key, value in dict.items(self):
-            dict.__setitem__(
-                result, copy.deepcopy(key, memo), copy.deepcopy(value, memo)
+    def __init__(
+        self,
+        table_name,
+        parent_alias,
+        table_alias,
+        join_type,
+        join_field,
+        nullable,
+        filtered_relation=None,
+    ):
+        # Join table
+        self.table_name = table_name
+        self.parent_alias = parent_alias
+        # Note: table_alias is not necessarily known at instantiation time.
+        self.table_alias = table_alias
+        # LOUTER or INNER
+        self.join_type = join_type
+        # A list of 2-tuples to use in the ON clause of the JOIN.
+        # Each 2-tuple will create one join condition in the ON clause.
+        if hasattr(join_field, "get_joining_fields"):
+            self.join_fields = join_field.get_joining_fields()
+            self.join_cols = tuple(
+                (lhs_field.column, rhs_field.column)
+                for lhs_field, rhs_field in self.join_fields
             )
-        return result
-
-    def __getstate__(self):
-        return {**self.__dict__, "_data": {k: self._getlist(k) for k in self}}
-
-    def __setstate__(self, obj_dict):
-        data = obj_dict.pop("_data", {})
-        for k, v in data.items():
-            self.setlist(k, v)
-        self.__dict__.update(obj_dict)
-
-    def get(self, key, default=None):
-        """
-        Return the last data value for the passed key. If key doesn't exist
-        or value is an empty list, return `default`.
-        """
-        try:
-            val = self[key]
-        except KeyError:
-            return default
-        if val == []:
-            return default
-        return val
-
-    def _getlist(self, key, default=None, force_list=False):
-        """
-        Return a list of values for the key.
-
-        Used internally to manipulate values list. If force_list is True,
-        return a new copy of values.
-        """
-        try:
-            values = super().__getitem__(key)
-        except KeyError:
-            if default is None:
-                return []
-            return default
         else:
-            if force_list:
-                values = list(values) if values is not None else None
-            return values
+            warnings.warn(
+                "The usage of get_joining_columns() in Join is deprecated. Implement "
+                "get_joining_fields() instead.",
+                RemovedInDjango60Warning,
+            )
+            self.join_fields = None
+            self.join_cols = join_field.get_joining_columns()
+        # Along which field (or ForeignObjectRel in the reverse join case)
+        self.join_field = join_field
+        # Is this join nullabled?
+        self.nullable = nullable
+        self.filtered_relation = filtered_relation
 
-    def getlist(self, key, default=None):
+    def as_sql(self, compiler, connection):
         """
-        Return the list of values for the key. If key doesn't exist, return a
-        default value.
+        Generate the full
+           LEFT OUTER JOIN sometable ON sometable.somecol = othertable.othercol, params
+        clause for this join.
         """
-        return self._getlist(key, default, force_list=True)
-
-    def setlist(self, key, list_):
-        super().__setitem__(key, list_)
-
-    def setdefault(self, key, default=None):
-        if key not in self:
-            self[key] = default
-            # Do not return default here because __setitem__() may store
-            # another value -- QueryDict.__setitem__() does. Look it up.
-        return self[key]
-
-    def setlistdefault(self, key, default_list=None):
-        if key not in self:
-            if default_list is None:
-                default_list = []
-            self.setlist(key, default_list)
-            # Do not return default_list here because setlist() may store
-            # another value -- QueryDict.setlist() does. Look it up.
-        return self._getlist(key)
-
-    def appendlist(self, key, value):
-        """Append an item to the internal list associated with key."""
-        self.setlistdefault(key).append(value)
-
-    def items(self):
-        """
-        Yield (key, value) pairs, where value is the last item in the list
-        associated with the key.
-        """
-        for key in self:
-            yield key, self[key]
-
-    def lists(self):
-        """Yield (key, list) pairs."""
-        return iter(super().items())
-
-    def values(self):
-        """Yield the last value on every key list."""
-        for key in self:
-            yield self[key]
-
-    def copy(self):
-        """Return a shallow copy of this object."""
-        return copy.copy(self)
-
-    def update(self, *args, **kwargs):
-        """Extend rather than replace existing key lists."""
-        if len(args) > 1:
-            raise TypeError("update expected at most 1 argument, got %d" % len(args))
-        if args:
-            arg = args[0]
-            if isinstance(arg, MultiValueDict):
-                for key, value_list in arg.lists():
-                    self.setlistdefault(key).extend(value_list)
+        join_conditions = []
+        params = []
+        qn = compiler.quote_name_unless_alias
+        qn2 = connection.ops.quote_name
+        # Add a join condition for each pair of joining columns.
+        # RemovedInDjango60Warning: when the depraction ends, replace with:
+        # for lhs, rhs in self.join_field:
+        join_fields = self.join_fields or self.join_cols
+        for lhs, rhs in join_fields:
+            if isinstance(lhs, str):
+                # RemovedInDjango60Warning: when the depraction ends, remove
+                # the branch for strings.
+                lhs_full_name = "%s.%s" % (qn(self.parent_alias), qn2(lhs))
+                rhs_full_name = "%s.%s" % (qn(self.table_alias), qn2(rhs))
             else:
-                if isinstance(arg, Mapping):
-                    arg = arg.items()
-                for key, value in arg:
-                    self.setlistdefault(key).append(value)
-        for key, value in kwargs.items():
-            self.setlistdefault(key).append(value)
+                lhs, rhs = connection.ops.prepare_join_on_clause(
+                    self.parent_alias, lhs, self.table_alias, rhs
+                )
+                lhs_sql, lhs_params = compiler.compile(lhs)
+                lhs_full_name = lhs_sql % lhs_params
+                rhs_sql, rhs_params = compiler.compile(rhs)
+                rhs_full_name = rhs_sql % rhs_params
+            join_conditions.append(f"{lhs_full_name} = {rhs_full_name}")
 
-    def dict(self):
-        """Return current object as a dict with singular values."""
-        return {key: self[key] for key in self}
+        # Add a single condition inside parentheses for whatever
+        # get_extra_restriction() returns.
+        extra_cond = self.join_field.get_extra_restriction(
+            self.table_alias, self.parent_alias
+        )
+        if extra_cond:
+            extra_sql, extra_params = compiler.compile(extra_cond)
+            join_conditions.append("(%s)" % extra_sql)
+            params.extend(extra_params)
+        if self.filtered_relation:
+            try:
+                extra_sql, extra_params = compiler.compile(self.filtered_relation)
+            except FullResultSet:
+                pass
+            else:
+                join_conditions.append("(%s)" % extra_sql)
+                params.extend(extra_params)
+        if not join_conditions:
+            # This might be a rel on the other end of an actual declared field.
+            declared_field = getattr(self.join_field, "field", self.join_field)
+            raise ValueError(
+                "Join generated an empty ON clause. %s did not yield either "
+                "joining columns or extra restrictions." % declared_field.__class__
+            )
+        on_clause_sql = " AND ".join(join_conditions)
+        alias_str = (
+            "" if self.table_alias == self.table_name else (" %s" % self.table_alias)
+        )
+        sql = "%s %s%s ON (%s)" % (
+            self.join_type,
+            qn(self.table_name),
+            alias_str,
+            on_clause_sql,
+        )
+        return sql, params
 
+    def relabeled_clone(self, change_map):
+        new_parent_alias = change_map.get(self.parent_alias, self.parent_alias)
+        new_table_alias = change_map.get(self.table_alias, self.table_alias)
+        if self.filtered_relation is not None:
+            filtered_relation = self.filtered_relation.relabeled_clone(change_map)
+        else:
+            filtered_relation = None
+        return self.__class__(
+            self.table_name,
+            new_parent_alias,
+            new_table_alias,
+            self.join_type,
+            self.join_field,
+            self.nullable,
+            filtered_relation=filtered_relation,
+        )
 
-class ImmutableList(tuple):
-    """
-    A tuple-like object that raises useful errors when it is asked to mutate.
-
-    Example::
-
-        >>> a = ImmutableList(range(5), warning="You cannot mutate this.")
-        >>> a[3] = '4'
-        Traceback (most recent call last):
-            ...
-        AttributeError: You cannot mutate this.
-    """
-
-    def __new__(cls, *args, warning="ImmutableList object is immutable.", **kwargs):
-        self = tuple.__new__(cls, *args, **kwargs)
-        self.warning = warning
-        return self
-
-    def complain(self, *args, **kwargs):
-        raise AttributeError(self.warning)
-
-    # All list mutation functions complain.
-    __delitem__ = complain
-    __delslice__ = complain
-    __iadd__ = complain
-    __imul__ = complain
-    __setitem__ = complain
-    __setslice__ = complain
-    append = complain
-    extend = complain
-    insert = complain
-    pop = complain
-    remove = complain
-    sort = complain
-    reverse = complain
-
-
-class DictWrapper(dict):
-    """
-    Wrap accesses to a dictionary so that certain values (those starting with
-    the specified prefix) are passed through a function before being returned.
-    The prefix is removed before looking up the real value.
-
-    Used by the SQL construction code to ensure that values are correctly
-    quoted before being used.
-    """
-
-    def __init__(self, data, func, prefix):
-        super().__init__(data)
-        self.func = func
-        self.prefix = prefix
-
-    def __getitem__(self, key):
-        """
-        Retrieve the real value after stripping the prefix string (if
-        present). If the prefix is present, pass the value through self.func
-        before returning, otherwise return the raw value.
-        """
-        use_func = key.startswith(self.prefix)
-        key = key.removeprefix(self.prefix)
-        value = super().__getitem__(key)
-        if use_func:
-            return self.func(value)
-        return value
-
-
-class CaseInsensitiveMapping(Mapping):
-    """
-    Mapping allowing case-insensitive key lookups. Original case of keys is
-    preserved for iteration and string representation.
-
-    Example::
-
-        >>> ci_map = CaseInsensitiveMapping({'name': 'Jane'})
-        >>> ci_map['Name']
-        Jane
-        >>> ci_map['NAME']
-        Jane
-        >>> ci_map['name']
-        Jane
-        >>> ci_map  # original case preserved
-        {'name': 'Jane'}
-    """
-
-    def __init__(self, data):
-        self._store = {k.lower(): (k, v) for k, v in self._unpack_items(data)}
-
-    def __getitem__(self, key):
-        return self._store[key.lower()][1]
-
-    def __len__(self):
-        return len(self._store)
+    @property
+    def identity(self):
+        return (
+            self.__class__,
+            self.table_name,
+            self.parent_alias,
+            self.join_field,
+            self.filtered_relation,
+        )
 
     def __eq__(self, other):
-        return isinstance(other, Mapping) and {
-            k.lower(): v for k, v in self.items()
-        } == {k.lower(): v for k, v in other.items()}
+        if not isinstance(other, Join):
+            return NotImplemented
+        return self.identity == other.identity
 
-    def __iter__(self):
-        return (original_key for original_key, value in self._store.values())
+    def __hash__(self):
+        return hash(self.identity)
 
-    def __repr__(self):
-        return repr({key: value for key, value in self._store.values()})
+    def demote(self):
+        new = self.relabeled_clone({})
+        new.join_type = INNER
+        return new
 
-    def copy(self):
-        return self
+    def promote(self):
+        new = self.relabeled_clone({})
+        new.join_type = LOUTER
+        return new
 
-    @staticmethod
-    def _unpack_items(data):
-        # Explicitly test for dict first as the common case for performance,
-        # avoiding abc's __instancecheck__ and _abc_instancecheck for the
-        # general Mapping case.
-        if isinstance(data, (dict, Mapping)):
-            yield from data.items()
-            return
-        for i, elem in enumerate(data):
-            if len(elem) != 2:
-                raise ValueError(
-                    "dictionary update sequence element #{} has length {}; "
-                    "2 is required.".format(i, len(elem))
-                )
-            if not isinstance(elem[0], str):
-                raise ValueError(
-                    "Element key %r invalid, only strings are allowed" % elem[0]
-                )
-            yield elem
+
+class BaseTable:
+    """
+    The BaseTable class is used for base table references in FROM clause. For
+    example, the SQL "foo" in
+        SELECT * FROM "foo" WHERE somecond
+    could be generated by this class.
+    """
+
+    join_type = None
+    parent_alias = None
+    filtered_relation = None
+
+    def __init__(self, table_name, alias):
+        self.table_name = table_name
+        self.table_alias = alias
+
+    def as_sql(self, compiler, connection):
+        alias_str = (
+            "" if self.table_alias == self.table_name else (" %s" % self.table_alias)
+        )
+        base_sql = compiler.quote_name_unless_alias(self.table_name)
+        return base_sql + alias_str, []
+
+    def relabeled_clone(self, change_map):
+        return self.__class__(
+            self.table_name, change_map.get(self.table_alias, self.table_alias)
+        )
+
+    @property
+    def identity(self):
+        return self.__class__, self.table_name, self.table_alias
+
+    def __eq__(self, other):
+        if not isinstance(other, BaseTable):
+            return NotImplemented
+        return self.identity == other.identity
+
+    def __hash__(self):
+        return hash(self.identity)

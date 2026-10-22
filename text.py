@@ -1,483 +1,376 @@
-import gzip
-import re
-import secrets
-import textwrap
-import unicodedata
-from collections import deque
-from gzip import GzipFile
-from gzip import compress as gzip_compress
-from html import escape
-from html.parser import HTMLParser
-from io import BytesIO
-
-from django.core.exceptions import SuspiciousFileOperation
-from django.utils.functional import (
-    SimpleLazyObject,
-    cached_property,
-    keep_lazy_text,
-    lazy,
-)
-from django.utils.regex_helper import _lazy_re_compile
-from django.utils.translation import gettext as _
-from django.utils.translation import gettext_lazy, pgettext
+from django.db import NotSupportedError
+from django.db.models.expressions import Func, Value
+from django.db.models.fields import CharField, IntegerField, TextField
+from django.db.models.functions import Cast, Coalesce
+from django.db.models.lookups import Transform
 
 
-@keep_lazy_text
-def capfirst(x):
-    """Capitalize the first letter of a string."""
-    if not x:
-        return x
-    if not isinstance(x, str):
-        x = str(x)
-    return x[0].upper() + x[1:]
-
-
-# Set up regular expressions
-re_newlines = _lazy_re_compile(r"\r\n|\r")  # Used in normalize_newlines
-re_camel_case = _lazy_re_compile(r"(((?<=[a-z])[A-Z])|([A-Z](?![A-Z]|$)))")
-
-
-@keep_lazy_text
-def wrap(text, width):
-    """
-    A word-wrap function that preserves existing line breaks. Expects that
-    existing line breaks are posix newlines.
-
-    Preserve all white space except added line breaks consume the space on
-    which they break the line.
-
-    Don't wrap long words, thus the output text may have lines longer than
-    ``width``.
-    """
-
-    wrapper = textwrap.TextWrapper(
-        width=width,
-        break_long_words=False,
-        break_on_hyphens=False,
-        replace_whitespace=False,
-    )
-    result = []
-    for line in text.splitlines():
-        wrapped = wrapper.wrap(line)
-        if not wrapped:
-            # If `line` contains only whitespaces that are dropped, restore it.
-            result.append(line)
-        else:
-            result.extend(wrapped)
-    if text.endswith("\n"):
-        # If `text` ends with a newline, preserve it.
-        result.append("")
-    return "\n".join(result)
-
-
-def add_truncation_text(text, truncate=None):
-    if truncate is None:
-        truncate = pgettext(
-            "String to return when truncating text", "%(truncated_text)s…"
-        )
-    if "%(truncated_text)s" in truncate:
-        return truncate % {"truncated_text": text}
-    # The truncation text didn't contain the %(truncated_text)s string
-    # replacement argument so just append it to the text.
-    if text.endswith(truncate):
-        # But don't append the truncation text if the current text already ends
-        # in this.
-        return text
-    return f"{text}{truncate}"
-
-
-def calculate_truncate_chars_length(length, replacement):
-    truncate_len = length
-    for char in add_truncation_text("", replacement):
-        if not unicodedata.combining(char):
-            truncate_len -= 1
-            if truncate_len == 0:
-                break
-    return truncate_len
-
-
-class TruncateHTMLParser(HTMLParser):
-    class TruncationCompleted(Exception):
-        pass
-
-    def __init__(self, *, length, replacement, convert_charrefs=True):
-        super().__init__(convert_charrefs=convert_charrefs)
-        self.tags = deque()
-        self.output = ""
-        self.remaining = length
-        self.replacement = replacement
-
-    @cached_property
-    def void_elements(self):
-        from django.utils.html import VOID_ELEMENTS
-
-        return VOID_ELEMENTS
-
-    def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
-        if tag not in self.void_elements:
-            self.handle_endtag(tag)
-
-    def handle_starttag(self, tag, attrs):
-        self.output += self.get_starttag_text()
-        if tag not in self.void_elements:
-            self.tags.appendleft(tag)
-
-    def handle_endtag(self, tag):
-        if tag not in self.void_elements:
-            self.output += f"</{tag}>"
-            # Remove from the stack only if the tag matches the most recently
-            # opened tag (LIFO). This avoids O(n) linear scans for unmatched
-            # end tags if `deque.remove()` would be called.
-            if self.tags and self.tags[0] == tag:
-                self.tags.popleft()
-
-    def handle_data(self, data):
-        data, output = self.process(data)
-        data_len = len(data)
-        if self.remaining < data_len:
-            self.remaining = 0
-            self.output += add_truncation_text(output, self.replacement)
-            raise self.TruncationCompleted
-        self.remaining -= data_len
-        self.output += output
-
-    def feed(self, data):
-        try:
-            super().feed(data)
-        except self.TruncationCompleted:
-            self.output += "".join([f"</{tag}>" for tag in self.tags])
-            self.tags.clear()
-            self.reset()
-        else:
-            # No data was handled.
-            self.reset()
-
-
-class TruncateCharsHTMLParser(TruncateHTMLParser):
-    def __init__(self, *, length, replacement, convert_charrefs=True):
-        self.length = length
-        self.processed_chars = 0
-        super().__init__(
-            length=calculate_truncate_chars_length(length, replacement),
-            replacement=replacement,
-            convert_charrefs=convert_charrefs,
+class MySQLSHA2Mixin:
+    def as_mysql(self, compiler, connection, **extra_context):
+        return super().as_sql(
+            compiler,
+            connection,
+            template="SHA2(%%(expressions)s, %s)" % self.function[3:],
+            **extra_context,
         )
 
-    def process(self, data):
-        self.processed_chars += len(data)
-        if (self.processed_chars == self.length) and (
-            len(self.output) + len(data) == len(self.rawdata)
+
+class OracleHashMixin:
+    def as_oracle(self, compiler, connection, **extra_context):
+        return super().as_sql(
+            compiler,
+            connection,
+            template=(
+                "LOWER(RAWTOHEX(STANDARD_HASH(UTL_I18N.STRING_TO_RAW("
+                "%(expressions)s, 'AL32UTF8'), '%(function)s')))"
+            ),
+            **extra_context,
+        )
+
+
+class PostgreSQLSHAMixin:
+    def as_postgresql(self, compiler, connection, **extra_context):
+        return super().as_sql(
+            compiler,
+            connection,
+            template="ENCODE(DIGEST(%(expressions)s, '%(function)s'), 'hex')",
+            function=self.function.lower(),
+            **extra_context,
+        )
+
+
+class Chr(Transform):
+    function = "CHR"
+    lookup_name = "chr"
+    output_field = CharField()
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        return super().as_sql(
+            compiler,
+            connection,
+            function="CHAR",
+            template="%(function)s(%(expressions)s USING utf16)",
+            **extra_context,
+        )
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        return super().as_sql(
+            compiler,
+            connection,
+            template="%(function)s(%(expressions)s USING NCHAR_CS)",
+            **extra_context,
+        )
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, function="CHAR", **extra_context)
+
+
+class ConcatPair(Func):
+    """
+    Concatenate two arguments together. This is used by `Concat` because not
+    all backend databases support more than two arguments.
+    """
+
+    function = "CONCAT"
+
+    def pipes_concat_sql(self, compiler, connection, **extra_context):
+        coalesced = self.coalesce()
+        return super(ConcatPair, coalesced).as_sql(
+            compiler,
+            connection,
+            template="(%(expressions)s)",
+            arg_joiner=" || ",
+            **extra_context,
+        )
+
+    as_sqlite = pipes_concat_sql
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        c = self.copy()
+        c.set_source_expressions(
+            [
+                (
+                    expression
+                    if isinstance(expression.output_field, (CharField, TextField))
+                    else Cast(expression, TextField())
+                )
+                for expression in c.get_source_expressions()
+            ]
+        )
+        return c.pipes_concat_sql(compiler, connection, **extra_context)
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        # Use CONCAT_WS with an empty separator so that NULLs are ignored.
+        return super().as_sql(
+            compiler,
+            connection,
+            function="CONCAT_WS",
+            template="%(function)s('', %(expressions)s)",
+            **extra_context,
+        )
+
+    def coalesce(self):
+        # null on either side results in null for expression, wrap with coalesce
+        c = self.copy()
+        c.set_source_expressions(
+            [
+                Coalesce(expression, Value(""))
+                for expression in c.get_source_expressions()
+            ]
+        )
+        return c
+
+
+class Concat(Func):
+    """
+    Concatenate text fields together. Backends that result in an entire
+    null expression when any arguments are null will wrap each argument in
+    coalesce functions to ensure a non-null result.
+    """
+
+    function = None
+    template = "%(expressions)s"
+
+    def __init__(self, *expressions, **extra):
+        if len(expressions) < 2:
+            raise ValueError("Concat must take at least two expressions")
+        paired = self._paired(expressions, output_field=extra.get("output_field"))
+        super().__init__(paired, **extra)
+
+    def _paired(self, expressions, output_field):
+        # wrap pairs of expressions in successive concat functions
+        # exp = [a, b, c, d]
+        # -> ConcatPair(a, ConcatPair(b, ConcatPair(c, d))))
+        if len(expressions) == 2:
+            return ConcatPair(*expressions, output_field=output_field)
+        return ConcatPair(
+            expressions[0],
+            self._paired(expressions[1:], output_field=output_field),
+            output_field=output_field,
+        )
+
+
+class Left(Func):
+    function = "LEFT"
+    arity = 2
+    output_field = CharField()
+
+    def __init__(self, expression, length, **extra):
+        """
+        expression: the name of a field, or an expression returning a string
+        length: the number of characters to return from the start of the string
+        """
+        if not hasattr(length, "resolve_expression"):
+            if length < 1:
+                raise ValueError("'length' must be greater than 0.")
+        super().__init__(expression, length, **extra)
+
+    def get_substr(self):
+        return Substr(self.source_expressions[0], Value(1), self.source_expressions[1])
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        return self.get_substr().as_oracle(compiler, connection, **extra_context)
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        return self.get_substr().as_sqlite(compiler, connection, **extra_context)
+
+
+class Length(Transform):
+    """Return the number of characters in the expression."""
+
+    function = "LENGTH"
+    lookup_name = "length"
+    output_field = IntegerField()
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        return super().as_sql(
+            compiler, connection, function="CHAR_LENGTH", **extra_context
+        )
+
+
+class Lower(Transform):
+    function = "LOWER"
+    lookup_name = "lower"
+
+
+class LPad(Func):
+    function = "LPAD"
+    output_field = CharField()
+
+    def __init__(self, expression, length, fill_text=Value(" "), **extra):
+        if (
+            not hasattr(length, "resolve_expression")
+            and length is not None
+            and length < 0
         ):
-            self.output += data
-            raise self.TruncationCompleted
-        output = escape("".join(data[: self.remaining]))
-        return data, output
+            raise ValueError("'length' must be greater or equal to 0.")
+        super().__init__(expression, length, fill_text, **extra)
 
 
-class TruncateWordsHTMLParser(TruncateHTMLParser):
-    def process(self, data):
-        data = re.split(r"(?<=\S)\s+(?=\S)", data)
-        output = escape(" ".join(data[: self.remaining]))
-        return data, output
+class LTrim(Transform):
+    function = "LTRIM"
+    lookup_name = "ltrim"
 
 
-class Truncator(SimpleLazyObject):
-    """
-    An object used to truncate text, either by characters or words.
-    """
-
-    def __init__(self, text):
-        super().__init__(lambda: str(text))
-
-    def chars(self, num, truncate=None, html=False):
-        """
-        Return the text truncated to be no longer than the specified number
-        of characters.
-
-        `truncate` specifies what should be used to notify that the string has
-        been truncated, defaulting to a translatable string of an ellipsis.
-        """
-        self._setup()
-        length = int(num)
-        if length <= 0:
-            return ""
-        text = unicodedata.normalize("NFC", self._wrapped)
-
-        if html:
-            parser = TruncateCharsHTMLParser(length=length, replacement=truncate)
-            parser.feed(text)
-            parser.close()
-            return parser.output
-        return self._text_chars(length, truncate, text)
-
-    def _text_chars(self, length, truncate, text):
-        """Truncate a string after a certain number of chars."""
-        truncate_len = calculate_truncate_chars_length(length, truncate)
-        s_len = 0
-        end_index = None
-        for i, char in enumerate(text):
-            if unicodedata.combining(char):
-                # Don't consider combining characters
-                # as adding to the string length
-                continue
-            s_len += 1
-            if end_index is None and s_len > truncate_len:
-                end_index = i
-            if s_len > length:
-                # Return the truncated string
-                return add_truncation_text(text[: end_index or 0], truncate)
-
-        # Return the original string since no truncation was necessary
-        return text
-
-    def words(self, num, truncate=None, html=False):
-        """
-        Truncate a string after a certain number of words. `truncate` specifies
-        what should be used to notify that the string has been truncated,
-        defaulting to ellipsis.
-        """
-        self._setup()
-        length = int(num)
-        if length <= 0:
-            return ""
-        if html:
-            parser = TruncateWordsHTMLParser(length=length, replacement=truncate)
-            parser.feed(self._wrapped)
-            parser.close()
-            return parser.output
-        return self._text_words(length, truncate)
-
-    def _text_words(self, length, truncate):
-        """
-        Truncate a string after a certain number of words.
-
-        Strip newlines in the string.
-        """
-        words = self._wrapped.split()
-        if len(words) > length:
-            words = words[:length]
-            return add_truncation_text(" ".join(words), truncate)
-        return " ".join(words)
+class MD5(OracleHashMixin, Transform):
+    function = "MD5"
+    lookup_name = "md5"
 
 
-@keep_lazy_text
-def get_valid_filename(name):
-    """
-    Return the given string converted to a string that can be used for a clean
-    filename. Remove leading and trailing spaces; convert other spaces to
-    underscores; and remove anything that is not an alphanumeric, dash,
-    underscore, or dot.
-    >>> get_valid_filename("john's portrait in 2004.jpg")
-    'johns_portrait_in_2004.jpg'
-    """
-    s = str(name).strip().replace(" ", "_")
-    s = re.sub(r"(?u)[^-\w.]", "", s)
-    if s in {"", ".", ".."}:
-        raise SuspiciousFileOperation("Could not derive file name from '%s'" % name)
-    return s
+class Ord(Transform):
+    function = "ASCII"
+    lookup_name = "ord"
+    output_field = IntegerField()
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, function="ORD", **extra_context)
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, function="UNICODE", **extra_context)
 
 
-@keep_lazy_text
-def get_text_list(list_, last_word=gettext_lazy("or")):
-    """
-    >>> get_text_list(['a', 'b', 'c', 'd'])
-    'a, b, c or d'
-    >>> get_text_list(['a', 'b', 'c'], 'and')
-    'a, b and c'
-    >>> get_text_list(['a', 'b'], 'and')
-    'a and b'
-    >>> get_text_list(['a'])
-    'a'
-    >>> get_text_list([])
-    ''
-    """
-    if not list_:
-        return ""
-    if len(list_) == 1:
-        return str(list_[0])
-    return "%s %s %s" % (
-        # Translators: This string is used as a separator between list elements
-        _(", ").join(str(i) for i in list_[:-1]),
-        str(last_word),
-        str(list_[-1]),
-    )
+class Repeat(Func):
+    function = "REPEAT"
+    output_field = CharField()
+
+    def __init__(self, expression, number, **extra):
+        if (
+            not hasattr(number, "resolve_expression")
+            and number is not None
+            and number < 0
+        ):
+            raise ValueError("'number' must be greater or equal to 0.")
+        super().__init__(expression, number, **extra)
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        expression, number = self.source_expressions
+        length = None if number is None else Length(expression) * number
+        rpad = RPad(expression, length, expression)
+        return rpad.as_sql(compiler, connection, **extra_context)
 
 
-@keep_lazy_text
-def normalize_newlines(text):
-    """Normalize CRLF and CR newlines to just LF."""
-    return re_newlines.sub("\n", str(text))
+class Replace(Func):
+    function = "REPLACE"
+
+    def __init__(self, expression, text, replacement=Value(""), **extra):
+        super().__init__(expression, text, replacement, **extra)
 
 
-@keep_lazy_text
-def phone2numeric(phone):
-    """Convert a phone number with letters into its numeric equivalent."""
-    char2number = {
-        "a": "2",
-        "b": "2",
-        "c": "2",
-        "d": "3",
-        "e": "3",
-        "f": "3",
-        "g": "4",
-        "h": "4",
-        "i": "4",
-        "j": "5",
-        "k": "5",
-        "l": "5",
-        "m": "6",
-        "n": "6",
-        "o": "6",
-        "p": "7",
-        "q": "7",
-        "r": "7",
-        "s": "7",
-        "t": "8",
-        "u": "8",
-        "v": "8",
-        "w": "9",
-        "x": "9",
-        "y": "9",
-        "z": "9",
-    }
-    return "".join(char2number.get(c, c) for c in phone.lower())
+class Reverse(Transform):
+    function = "REVERSE"
+    lookup_name = "reverse"
 
-
-def _get_random_filename(max_random_bytes):
-    return b"a" * secrets.randbelow(max_random_bytes)
-
-
-def compress_string(s, *, max_random_bytes=None):
-    compressed_data = gzip_compress(s, compresslevel=6, mtime=0)
-
-    if not max_random_bytes:
-        return compressed_data
-
-    compressed_view = memoryview(compressed_data)
-    header = bytearray(compressed_view[:10])
-    header[3] = gzip.FNAME
-
-    filename = _get_random_filename(max_random_bytes) + b"\x00"
-
-    return bytes(header) + filename + compressed_view[10:]
-
-
-class StreamingBuffer(BytesIO):
-    def read(self):
-        ret = self.getvalue()
-        self.seek(0)
-        self.truncate()
-        return ret
-
-
-# Like compress_string, but for iterators of strings.
-def compress_sequence(sequence, *, max_random_bytes=None):
-    buf = StreamingBuffer()
-    filename = _get_random_filename(max_random_bytes) if max_random_bytes else None
-    with GzipFile(
-        filename=filename, mode="wb", compresslevel=6, fileobj=buf, mtime=0
-    ) as zfile:
-        # Output headers...
-        yield buf.read()
-        for item in sequence:
-            zfile.write(item)
-            data = buf.read()
-            if data:
-                yield data
-    yield buf.read()
-
-
-# Expression to match some_token and some_token="with spaces" (and similarly
-# for single-quoted strings).
-smart_split_re = _lazy_re_compile(
-    r"""
-    ((?:
-        [^\s'"]*
-        (?:
-            (?:"(?:[^"\\]|\\.)*" | '(?:[^'\\]|\\.)*')
-            [^\s'"]*
-        )+
-    ) | \S+)
-""",
-    re.VERBOSE,
-)
-
-
-def smart_split(text):
-    r"""
-    Generator that splits a string by spaces, leaving quoted phrases together.
-    Supports both single and double quotes, and supports escaping quotes with
-    backslashes. In the output, strings will keep their initial and trailing
-    quote marks and escaped quotes will remain escaped (the results can then
-    be further processed with unescape_string_literal()).
-
-    >>> list(smart_split(r'This is "a person\'s" test.'))
-    ['This', 'is', '"a person\\\'s"', 'test.']
-    >>> list(smart_split(r"Another 'person\'s' test."))
-    ['Another', "'person\\'s'", 'test.']
-    >>> list(smart_split(r'A "\"funky\" style" test.'))
-    ['A', '"\\"funky\\" style"', 'test.']
-    """
-    for bit in smart_split_re.finditer(str(text)):
-        yield bit[0]
-
-
-@keep_lazy_text
-def unescape_string_literal(s):
-    r"""
-    Convert quoted string literals to unquoted strings with escaped quotes and
-    backslashes unquoted::
-
-        >>> unescape_string_literal('"abc"')
-        'abc'
-        >>> unescape_string_literal("'abc'")
-        'abc'
-        >>> unescape_string_literal('"a \"bc\""')
-        'a "bc"'
-        >>> unescape_string_literal("'\'ab\' c'")
-        "'ab' c"
-    """
-    if not s or s[0] not in "\"'" or s[-1] != s[0]:
-        raise ValueError("Not a string literal: %r" % s)
-    quote = s[0]
-    return s[1:-1].replace(r"\%s" % quote, quote).replace(r"\\", "\\")
-
-
-@keep_lazy_text
-def slugify(value, allow_unicode=False):
-    """
-    Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
-    dashes to single dashes. Remove characters that aren't alphanumerics,
-    underscores, or hyphens. Convert to lowercase. Also strip leading and
-    trailing whitespace, dashes, and underscores.
-    """
-    value = str(value)
-    if allow_unicode:
-        value = unicodedata.normalize("NFKC", value)
-    else:
-        value = (
-            unicodedata.normalize("NFKD", value)
-            .encode("ascii", "ignore")
-            .decode("ascii")
+    def as_oracle(self, compiler, connection, **extra_context):
+        # REVERSE in Oracle is undocumented and doesn't support multi-byte
+        # strings. Use a special subquery instead.
+        suffix = connection.features.bare_select_suffix
+        sql, params = super().as_sql(
+            compiler,
+            connection,
+            template=(
+                "(SELECT LISTAGG(s) WITHIN GROUP (ORDER BY n DESC) FROM "
+                f"(SELECT LEVEL n, SUBSTR(%(expressions)s, LEVEL, 1) s{suffix} "
+                "CONNECT BY LEVEL <= LENGTH(%(expressions)s)) "
+                "GROUP BY %(expressions)s)"
+            ),
+            **extra_context,
         )
-    value = re.sub(r"[^\w\s-]", "", value.lower())
-    return re.sub(r"[-\s]+", "-", value).strip("-_")
+        return sql, params * 3
 
 
-def camel_case_to_spaces(value):
+class Right(Left):
+    function = "RIGHT"
+
+    def get_substr(self):
+        return Substr(
+            self.source_expressions[0],
+            self.source_expressions[1] * Value(-1),
+            self.source_expressions[1],
+        )
+
+
+class RPad(LPad):
+    function = "RPAD"
+
+
+class RTrim(Transform):
+    function = "RTRIM"
+    lookup_name = "rtrim"
+
+
+class SHA1(OracleHashMixin, PostgreSQLSHAMixin, Transform):
+    function = "SHA1"
+    lookup_name = "sha1"
+
+
+class SHA224(MySQLSHA2Mixin, PostgreSQLSHAMixin, Transform):
+    function = "SHA224"
+    lookup_name = "sha224"
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        raise NotSupportedError("SHA224 is not supported on Oracle.")
+
+
+class SHA256(MySQLSHA2Mixin, OracleHashMixin, PostgreSQLSHAMixin, Transform):
+    function = "SHA256"
+    lookup_name = "sha256"
+
+
+class SHA384(MySQLSHA2Mixin, OracleHashMixin, PostgreSQLSHAMixin, Transform):
+    function = "SHA384"
+    lookup_name = "sha384"
+
+
+class SHA512(MySQLSHA2Mixin, OracleHashMixin, PostgreSQLSHAMixin, Transform):
+    function = "SHA512"
+    lookup_name = "sha512"
+
+
+class StrIndex(Func):
     """
-    Split CamelCase and convert to lowercase. Strip surrounding whitespace.
+    Return a positive integer corresponding to the 1-indexed position of the
+    first occurrence of a substring inside another string, or 0 if the
+    substring is not found.
     """
-    return re_camel_case.sub(r" \1", value).strip().lower()
+
+    function = "INSTR"
+    arity = 2
+    output_field = IntegerField()
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, function="STRPOS", **extra_context)
 
 
-def _format_lazy(format_string, *args, **kwargs):
-    """
-    Apply str.format() on 'format_string' where format_string, args,
-    and/or kwargs might be lazy.
-    """
-    return format_string.format(*args, **kwargs)
+class Substr(Func):
+    function = "SUBSTRING"
+    output_field = CharField()
+
+    def __init__(self, expression, pos, length=None, **extra):
+        """
+        expression: the name of a field, or an expression returning a string
+        pos: an integer > 0, or an expression returning an integer
+        length: an optional number of characters to return
+        """
+        if not hasattr(pos, "resolve_expression"):
+            if pos < 1:
+                raise ValueError("'pos' must be greater than 0")
+        expressions = [expression, pos]
+        if length is not None:
+            expressions.append(length)
+        super().__init__(*expressions, **extra)
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, function="SUBSTR", **extra_context)
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, function="SUBSTR", **extra_context)
 
 
-format_lazy = lazy(_format_lazy, str)
+class Trim(Transform):
+    function = "TRIM"
+    lookup_name = "trim"
+
+
+class Upper(Transform):
+    function = "UPPER"
+    lookup_name = "upper"

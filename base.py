@@ -1,379 +1,206 @@
-"""
-SQLite backend for the sqlite3 module in the standard library.
-"""
+import os
+import pathlib
 
-import datetime
-import decimal
-import warnings
-from collections.abc import Mapping
-from itertools import chain, tee
-from sqlite3 import dbapi2 as Database
-
-from django.core.exceptions import ImproperlyConfigured
-from django.db import IntegrityError
-from django.db.backends.base.base import BaseDatabaseWrapper
-from django.utils.asyncio import async_unsafe
-from django.utils.dateparse import parse_date, parse_datetime, parse_time
-from django.utils.regex_helper import _lazy_re_compile
-
-from ._functions import register as register_functions
-from .client import DatabaseClient
-from .creation import DatabaseCreation
-from .features import DatabaseFeatures
-from .introspection import DatabaseIntrospection
-from .operations import DatabaseOperations
-from .schema import DatabaseSchemaEditor
+from django.core.exceptions import SuspiciousFileOperation
+from django.core.files import File
+from django.core.files.utils import validate_file_name
+from django.utils.crypto import get_random_string
+from django.utils.text import get_valid_filename
 
 
-def decoder(conv_func):
+class Storage:
     """
-    Convert bytestrings from Python's sqlite3 interface to a regular string.
+    A base storage class, providing some default behaviors that all other
+    storage systems can inherit or override, as necessary.
     """
-    return lambda s: conv_func(s.decode())
 
+    # The following methods represent a public interface to private methods.
+    # These shouldn't be overridden by subclasses unless absolutely necessary.
 
-def adapt_date(val):
-    return val.isoformat()
+    def open(self, name, mode="rb"):
+        """Retrieve the specified file from storage."""
+        return self._open(name, mode)
 
-
-def adapt_datetime(val):
-    return val.isoformat(" ")
-
-
-def _get_varchar_column(data):
-    if data["max_length"] is None:
-        return "varchar"
-    return "varchar(%(max_length)s)" % data
-
-
-Database.register_converter("bool", b"1".__eq__)
-Database.register_converter("date", decoder(parse_date))
-Database.register_converter("time", decoder(parse_time))
-Database.register_converter("datetime", decoder(parse_datetime))
-Database.register_converter("timestamp", decoder(parse_datetime))
-
-Database.register_adapter(decimal.Decimal, str)
-Database.register_adapter(datetime.date, adapt_date)
-Database.register_adapter(datetime.datetime, adapt_datetime)
-
-
-class DatabaseWrapper(BaseDatabaseWrapper):
-    vendor = "sqlite"
-    display_name = "SQLite"
-    # SQLite doesn't actually support most of these types, but it "does the right
-    # thing" given more verbose field definitions, so leave them as is so that
-    # schema inspection is more useful.
-    data_types = {
-        "AutoField": "integer",
-        "BigAutoField": "integer",
-        "BinaryField": "BLOB",
-        "BooleanField": "bool",
-        "CharField": _get_varchar_column,
-        "DateField": "date",
-        "DateTimeField": "datetime",
-        "DecimalField": "decimal",
-        "DurationField": "bigint",
-        "FileField": "varchar(%(max_length)s)",
-        "FilePathField": "varchar(%(max_length)s)",
-        "FloatField": "real",
-        "IntegerField": "integer",
-        "BigIntegerField": "bigint",
-        "IPAddressField": "char(15)",
-        "GenericIPAddressField": "char(39)",
-        "JSONField": "text",
-        "OneToOneField": "integer",
-        "PositiveBigIntegerField": "bigint unsigned",
-        "PositiveIntegerField": "integer unsigned",
-        "PositiveSmallIntegerField": "smallint unsigned",
-        "SlugField": "varchar(%(max_length)s)",
-        "SmallAutoField": "integer",
-        "SmallIntegerField": "smallint",
-        "TextField": "text",
-        "TimeField": "time",
-        "UUIDField": "char(32)",
-    }
-    data_type_check_constraints = {
-        "PositiveBigIntegerField": '"%(column)s" >= 0',
-        "JSONField": '(JSON_VALID("%(column)s") OR "%(column)s" IS NULL)',
-        "PositiveIntegerField": '"%(column)s" >= 0',
-        "PositiveSmallIntegerField": '"%(column)s" >= 0',
-    }
-    data_types_suffix = {
-        "AutoField": "AUTOINCREMENT",
-        "BigAutoField": "AUTOINCREMENT",
-        "SmallAutoField": "AUTOINCREMENT",
-    }
-    # SQLite requires LIKE statements to include an ESCAPE clause if the value
-    # being escaped has a percent or underscore in it.
-    # See https://www.sqlite.org/lang_expr.html for an explanation.
-    operators = {
-        "exact": "= %s",
-        "iexact": "LIKE %s ESCAPE '\\'",
-        "contains": "LIKE %s ESCAPE '\\'",
-        "icontains": "LIKE %s ESCAPE '\\'",
-        "regex": "REGEXP %s",
-        "iregex": "REGEXP '(?i)' || %s",
-        "gt": "> %s",
-        "gte": ">= %s",
-        "lt": "< %s",
-        "lte": "<= %s",
-        "startswith": "LIKE %s ESCAPE '\\'",
-        "endswith": "LIKE %s ESCAPE '\\'",
-        "istartswith": "LIKE %s ESCAPE '\\'",
-        "iendswith": "LIKE %s ESCAPE '\\'",
-    }
-
-    # The patterns below are used to generate SQL pattern lookup clauses when
-    # the right-hand side of the lookup isn't a raw string (it might be an expression
-    # or the result of a bilateral transformation).
-    # In those cases, special characters for LIKE operators (e.g. \, *, _) should be
-    # escaped on database side.
-    #
-    # Note: we use str.format() here for readability as '%' is used as a wildcard for
-    # the LIKE operator.
-    pattern_esc = r"REPLACE(REPLACE(REPLACE({}, '\', '\\'), '%%', '\%%'), '_', '\_')"
-    pattern_ops = {
-        "contains": r"LIKE '%%' || {} || '%%' ESCAPE '\'",
-        "icontains": r"LIKE '%%' || UPPER({}) || '%%' ESCAPE '\'",
-        "startswith": r"LIKE {} || '%%' ESCAPE '\'",
-        "istartswith": r"LIKE UPPER({}) || '%%' ESCAPE '\'",
-        "endswith": r"LIKE '%%' || {} ESCAPE '\'",
-        "iendswith": r"LIKE '%%' || UPPER({}) ESCAPE '\'",
-    }
-
-    transaction_modes = frozenset(["DEFERRED", "EXCLUSIVE", "IMMEDIATE"])
-
-    Database = Database
-    SchemaEditorClass = DatabaseSchemaEditor
-    # Classes instantiated in __init__().
-    client_class = DatabaseClient
-    creation_class = DatabaseCreation
-    features_class = DatabaseFeatures
-    introspection_class = DatabaseIntrospection
-    ops_class = DatabaseOperations
-
-    def get_connection_params(self):
-        settings_dict = self.settings_dict
-        if not settings_dict["NAME"]:
-            raise ImproperlyConfigured(
-                "settings.DATABASES is improperly configured. "
-                "Please supply the NAME value."
-            )
-        kwargs = {
-            "database": settings_dict["NAME"],
-            "detect_types": Database.PARSE_DECLTYPES | Database.PARSE_COLNAMES,
-            **settings_dict["OPTIONS"],
-        }
-        # Always allow the underlying SQLite connection to be shareable
-        # between multiple threads. The safe-guarding will be handled at a
-        # higher level by the `BaseDatabaseWrapper.allow_thread_sharing`
-        # property. This is necessary as the shareability is disabled by
-        # default in sqlite3 and it cannot be changed once a connection is
-        # opened.
-        if "check_same_thread" in kwargs and kwargs["check_same_thread"]:
-            warnings.warn(
-                "The `check_same_thread` option was provided and set to "
-                "True. It will be overridden with False. Use the "
-                "`DatabaseWrapper.allow_thread_sharing` property instead "
-                "for controlling thread shareability.",
-                RuntimeWarning,
-            )
-        kwargs.update({"check_same_thread": False, "uri": True})
-        transaction_mode = kwargs.pop("transaction_mode", None)
-        if (
-            transaction_mode is not None
-            and transaction_mode.upper() not in self.transaction_modes
-        ):
-            allowed_transaction_modes = ", ".join(
-                [f"{mode!r}" for mode in sorted(self.transaction_modes)]
-            )
-            raise ImproperlyConfigured(
-                f"settings.DATABASES[{self.alias!r}]['OPTIONS']['transaction_mode'] "
-                f"is improperly configured to '{transaction_mode}'. Use one of "
-                f"{allowed_transaction_modes}, or None."
-            )
-        self.transaction_mode = transaction_mode.upper() if transaction_mode else None
-
-        init_command = kwargs.pop("init_command", "")
-        self.init_commands = init_command.split(";")
-        return kwargs
-
-    def get_database_version(self):
-        return self.Database.sqlite_version_info
-
-    @async_unsafe
-    def get_new_connection(self, conn_params):
-        conn = Database.connect(**conn_params)
-        register_functions(conn)
-
-        conn.execute("PRAGMA foreign_keys = ON")
-        # The macOS bundled SQLite defaults legacy_alter_table ON, which
-        # prevents atomic table renames.
-        conn.execute("PRAGMA legacy_alter_table = OFF")
-        for init_command in self.init_commands:
-            if init_command := init_command.strip():
-                conn.execute(init_command)
-        return conn
-
-    def create_cursor(self, name=None):
-        return self.connection.cursor(factory=SQLiteCursorWrapper)
-
-    @async_unsafe
-    def close(self):
-        self.validate_thread_sharing()
-        # If database is in memory, closing the connection destroys the
-        # database. To prevent accidental data loss, ignore close requests on
-        # an in-memory db.
-        if not self.is_in_memory_db():
-            BaseDatabaseWrapper.close(self)
-
-    def _savepoint_allowed(self):
-        # When 'isolation_level' is not None, sqlite3 commits before each
-        # savepoint; it's a bug. When it is None, savepoints don't make sense
-        # because autocommit is enabled. The only exception is inside 'atomic'
-        # blocks. To work around that bug, on SQLite, 'atomic' starts a
-        # transaction explicitly rather than simply disable autocommit.
-        return self.in_atomic_block
-
-    def _set_autocommit(self, autocommit):
-        if autocommit:
-            level = None
-        else:
-            # sqlite3's internal default is ''. It's different from None.
-            # See Modules/_sqlite/connection.c.
-            level = ""
-        # 'isolation_level' is a misleading API.
-        # SQLite always runs at the SERIALIZABLE isolation level.
-        with self.wrap_database_errors:
-            self.connection.isolation_level = level
-
-    def disable_constraint_checking(self):
-        with self.cursor() as cursor:
-            cursor.execute("PRAGMA foreign_keys = OFF")
-            # Foreign key constraints cannot be turned off while in a multi-
-            # statement transaction. Fetch the current state of the pragma
-            # to determine if constraints are effectively disabled.
-            enabled = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
-        return not bool(enabled)
-
-    def enable_constraint_checking(self):
-        with self.cursor() as cursor:
-            cursor.execute("PRAGMA foreign_keys = ON")
-
-    def check_constraints(self, table_names=None):
+    def save(self, name, content, max_length=None):
         """
-        Check each table name in `table_names` for rows with invalid foreign
-        key references. This method is intended to be used in conjunction with
-        `disable_constraint_checking()` and `enable_constraint_checking()`, to
-        determine if rows with invalid references were entered while constraint
-        checks were off.
+        Save new content to the file specified by name. The content should be
+        a proper File object or any Python file-like object, ready to be read
+        from the beginning.
         """
-        with self.cursor() as cursor:
-            if table_names is None:
-                violations = cursor.execute("PRAGMA foreign_key_check").fetchall()
-            else:
-                violations = chain.from_iterable(
-                    cursor.execute(
-                        "PRAGMA foreign_key_check(%s)" % self.ops.quote_name(table_name)
-                    ).fetchall()
-                    for table_name in table_names
-                )
-            # See https://www.sqlite.org/pragma.html#pragma_foreign_key_check
-            for (
-                table_name,
-                rowid,
-                referenced_table_name,
-                foreign_key_index,
-            ) in violations:
-                foreign_key = cursor.execute(
-                    "PRAGMA foreign_key_list(%s)" % self.ops.quote_name(table_name)
-                ).fetchall()[foreign_key_index]
-                column_name, referenced_column_name = foreign_key[3:5]
-                primary_key_column_name = self.introspection.get_primary_key_column(
-                    cursor, table_name
-                )
-                primary_key_value, bad_value = cursor.execute(
-                    "SELECT %s, %s FROM %s WHERE rowid = %%s"
-                    % (
-                        self.ops.quote_name(primary_key_column_name),
-                        self.ops.quote_name(column_name),
-                        self.ops.quote_name(table_name),
-                    ),
-                    (rowid,),
-                ).fetchone()
-                raise IntegrityError(
-                    "The row in table '%s' with primary key '%s' has an "
-                    "invalid foreign key: %s.%s contains a value '%s' that "
-                    "does not have a corresponding value in %s.%s."
-                    % (
-                        table_name,
-                        primary_key_value,
-                        table_name,
-                        column_name,
-                        bad_value,
-                        referenced_table_name,
-                        referenced_column_name,
+        # Get the proper name for the file, as it will actually be saved.
+        if name is None:
+            name = content.name
+
+        if not hasattr(content, "chunks"):
+            content = File(content, name)
+
+        # Ensure that the name is valid, before and after having the storage
+        # system potentially modifying the name. This duplicates the check made
+        # inside `get_available_name` but it's necessary for those cases where
+        # `get_available_name` is overriden and validation is lost.
+        validate_file_name(name, allow_relative_path=True)
+
+        # Potentially find a different name depending on storage constraints.
+        name = self.get_available_name(name, max_length=max_length)
+        # Validate the (potentially) new name.
+        validate_file_name(name, allow_relative_path=True)
+
+        # The save operation should return the actual name of the file saved.
+        name = self._save(name, content)
+        # Ensure that the name returned from the storage system is still valid.
+        validate_file_name(name, allow_relative_path=True)
+        return name
+
+    def is_name_available(self, name, max_length=None):
+        exceeds_max_length = max_length and len(name) > max_length
+        return not self.exists(name) and not exceeds_max_length
+
+    # These methods are part of the public API, with default implementations.
+
+    def get_valid_name(self, name):
+        """
+        Return a filename, based on the provided filename, that's suitable for
+        use in the target storage system.
+        """
+        return get_valid_filename(name)
+
+    def get_alternative_name(self, file_root, file_ext):
+        """
+        Return an alternative filename, by adding an underscore and a random 7
+        character alphanumeric string (before the file extension, if one
+        exists) to the filename.
+        """
+        return "%s_%s%s" % (file_root, get_random_string(7), file_ext)
+
+    def get_available_name(self, name, max_length=None):
+        """
+        Return a filename that's free on the target storage system and
+        available for new content to be written to.
+        """
+        name = str(name).replace("\\", "/")
+        dir_name, file_name = os.path.split(name)
+        if ".." in pathlib.PurePath(dir_name).parts:
+            raise SuspiciousFileOperation(
+                "Detected path traversal attempt in '%s'" % dir_name
+            )
+        validate_file_name(file_name)
+        file_ext = "".join(pathlib.PurePath(file_name).suffixes)
+        file_root = file_name.removesuffix(file_ext)
+        # If the filename is not available, generate an alternative
+        # filename until one is available.
+        # Truncate original name if required, so the new filename does not
+        # exceed the max_length.
+        while not self.is_name_available(name, max_length=max_length):
+            # file_ext includes the dot.
+            name = os.path.join(
+                dir_name, self.get_alternative_name(file_root, file_ext)
+            )
+            if max_length is None:
+                continue
+            # Truncate file_root if max_length exceeded.
+            truncation = len(name) - max_length
+            if truncation > 0:
+                file_root = file_root[:-truncation]
+                # Entire file_root was truncated in attempt to find an
+                # available filename.
+                if not file_root:
+                    raise SuspiciousFileOperation(
+                        'Storage can not find an available filename for "%s". '
+                        "Please make sure that the corresponding file field "
+                        'allows sufficient "max_length".' % name
                     )
+                name = os.path.join(
+                    dir_name, self.get_alternative_name(file_root, file_ext)
                 )
+        return name
 
-    def is_usable(self):
-        return True
-
-    def _start_transaction_under_autocommit(self):
+    def generate_filename(self, filename):
         """
-        Start a transaction explicitly in autocommit mode.
-
-        Staying in autocommit mode works around a bug of sqlite3 that breaks
-        savepoints when autocommit is disabled.
+        Validate the filename by calling get_valid_name() and return a filename
+        to be passed to the save() method.
         """
-        if self.transaction_mode is None:
-            self.cursor().execute("BEGIN")
-        else:
-            self.cursor().execute(f"BEGIN {self.transaction_mode}")
+        filename = str(filename).replace("\\", "/")
+        # `filename` may include a path as returned by FileField.upload_to.
+        dirname, filename = os.path.split(filename)
+        if ".." in pathlib.PurePath(dirname).parts:
+            raise SuspiciousFileOperation(
+                "Detected path traversal attempt in '%s'" % dirname
+            )
+        return os.path.normpath(os.path.join(dirname, self.get_valid_name(filename)))
 
-    def is_in_memory_db(self):
-        return self.creation.is_in_memory_db(self.settings_dict["NAME"])
+    def path(self, name):
+        """
+        Return a local filesystem path where the file can be retrieved using
+        Python's built-in open() function. Storage systems that can't be
+        accessed using open() should *not* implement this method.
+        """
+        raise NotImplementedError("This backend doesn't support absolute paths.")
 
+    # The following methods form the public API for storage systems, but with
+    # no default implementations. Subclasses must implement *all* of these.
 
-FORMAT_QMARK_REGEX = _lazy_re_compile(r"(?<!%)%s")
+    def delete(self, name):
+        """
+        Delete the specified file from the storage system.
+        """
+        raise NotImplementedError(
+            "subclasses of Storage must provide a delete() method"
+        )
 
+    def exists(self, name):
+        """
+        Return True if a file referenced by the given name already exists in the
+        storage system, or False if the name is available for a new file.
+        """
+        raise NotImplementedError(
+            "subclasses of Storage must provide an exists() method"
+        )
 
-class SQLiteCursorWrapper(Database.Cursor):
-    """
-    Django uses the "format" and "pyformat" styles, but Python's sqlite3 module
-    supports neither of these styles.
+    def listdir(self, path):
+        """
+        List the contents of the specified path. Return a 2-tuple of lists:
+        the first item being directories, the second item being files.
+        """
+        raise NotImplementedError(
+            "subclasses of Storage must provide a listdir() method"
+        )
 
-    This wrapper performs the following conversions:
+    def size(self, name):
+        """
+        Return the total size, in bytes, of the file specified by name.
+        """
+        raise NotImplementedError("subclasses of Storage must provide a size() method")
 
-    - "format" style to "qmark" style
-    - "pyformat" style to "named" style
+    def url(self, name):
+        """
+        Return an absolute URL where the file's contents can be accessed
+        directly by a web browser.
+        """
+        raise NotImplementedError("subclasses of Storage must provide a url() method")
 
-    In both cases, if you want to use a literal "%s", you'll need to use "%%s".
-    """
+    def get_accessed_time(self, name):
+        """
+        Return the last accessed time (as a datetime) of the file specified by
+        name. The datetime will be timezone-aware if USE_TZ=True.
+        """
+        raise NotImplementedError(
+            "subclasses of Storage must provide a get_accessed_time() method"
+        )
 
-    def execute(self, query, params=None):
-        if params is None:
-            return super().execute(query)
-        # Extract names if params is a mapping, i.e. "pyformat" style is used.
-        param_names = list(params) if isinstance(params, Mapping) else None
-        query = self.convert_query(query, param_names=param_names)
-        return super().execute(query, params)
+    def get_created_time(self, name):
+        """
+        Return the creation time (as a datetime) of the file specified by name.
+        The datetime will be timezone-aware if USE_TZ=True.
+        """
+        raise NotImplementedError(
+            "subclasses of Storage must provide a get_created_time() method"
+        )
 
-    def executemany(self, query, param_list):
-        # Extract names if params is a mapping, i.e. "pyformat" style is used.
-        # Peek carefully as a generator can be passed instead of a list/tuple.
-        peekable, param_list = tee(iter(param_list))
-        if (params := next(peekable, None)) and isinstance(params, Mapping):
-            param_names = list(params)
-        else:
-            param_names = None
-        query = self.convert_query(query, param_names=param_names)
-        return super().executemany(query, param_list)
-
-    def convert_query(self, query, *, param_names=None):
-        if param_names is None:
-            # Convert from "format" style to "qmark" style.
-            return FORMAT_QMARK_REGEX.sub("?", query).replace("%%", "%")
-        else:
-            # Convert from "pyformat" style to "named" style.
-            return query % {name: f":{name}" for name in param_names}
+    def get_modified_time(self, name):
+        """
+        Return the last modified time (as a datetime) of the file specified by
+        name. The datetime will be timezone-aware if USE_TZ=True.
+        """
+        raise NotImplementedError(
+            "subclasses of Storage must provide a get_modified_time() method"
+        )

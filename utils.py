@@ -1,99 +1,77 @@
-import datetime
-import decimal
+import os
+import pathlib
 
-from .base import Database
+from django.core.exceptions import SuspiciousFileOperation
 
 
-class InsertVar:
+def validate_file_name(name, allow_relative_path=False):
+    # Remove potentially dangerous names
+    if os.path.basename(name) in {"", ".", ".."}:
+        raise SuspiciousFileOperation("Could not derive file name from '%s'" % name)
+
+    if allow_relative_path:
+        # Ensure that name can be treated as a pure posix path, i.e. Unix
+        # style (with forward slashes).
+        path = pathlib.PurePosixPath(str(name).replace("\\", "/"))
+        if path.is_absolute() or ".." in path.parts:
+            raise SuspiciousFileOperation(
+                "Detected path traversal attempt in '%s'" % name
+            )
+    elif name != os.path.basename(name):
+        raise SuspiciousFileOperation("File name '%s' includes path elements" % name)
+
+    return name
+
+
+class FileProxyMixin:
     """
-    A late-binding cursor variable that can be passed to Cursor.execute
-    as a parameter, in order to receive the id of the row created by an
-    insert statement.
-    """
+    A mixin class used to forward file methods to an underlying file
+    object.  The internal file object has to be called "file"::
 
-    types = {
-        "AutoField": int,
-        "BigAutoField": int,
-        "SmallAutoField": int,
-        "IntegerField": int,
-        "BigIntegerField": int,
-        "SmallIntegerField": int,
-        "PositiveBigIntegerField": int,
-        "PositiveSmallIntegerField": int,
-        "PositiveIntegerField": int,
-        "BooleanField": int,
-        "FloatField": Database.DB_TYPE_BINARY_DOUBLE,
-        "DateTimeField": Database.DB_TYPE_TIMESTAMP,
-        "DateField": datetime.date,
-        "DecimalField": decimal.Decimal,
-    }
-
-    def __init__(self, field):
-        internal_type = getattr(field, "target_field", field).get_internal_type()
-        self.db_type = self.types.get(internal_type, str)
-        self.bound_param = None
-
-    def bind_parameter(self, cursor):
-        self.bound_param = cursor.cursor.var(self.db_type)
-        return self.bound_param
-
-    def get_value(self):
-        return self.bound_param.getvalue()
-
-
-class Oracle_datetime(datetime.datetime):
-    """
-    A datetime object, with an additional class attribute
-    to tell oracledb to save the microseconds too.
+        class FileProxy(FileProxyMixin):
+            def __init__(self, file):
+                self.file = file
     """
 
-    input_size = Database.DB_TYPE_TIMESTAMP
+    encoding = property(lambda self: self.file.encoding)
+    fileno = property(lambda self: self.file.fileno)
+    flush = property(lambda self: self.file.flush)
+    isatty = property(lambda self: self.file.isatty)
+    newlines = property(lambda self: self.file.newlines)
+    read = property(lambda self: self.file.read)
+    readinto = property(lambda self: self.file.readinto)
+    readline = property(lambda self: self.file.readline)
+    readlines = property(lambda self: self.file.readlines)
+    seek = property(lambda self: self.file.seek)
+    tell = property(lambda self: self.file.tell)
+    truncate = property(lambda self: self.file.truncate)
+    write = property(lambda self: self.file.write)
+    writelines = property(lambda self: self.file.writelines)
 
-    @classmethod
-    def from_datetime(cls, dt):
-        return Oracle_datetime(
-            dt.year,
-            dt.month,
-            dt.day,
-            dt.hour,
-            dt.minute,
-            dt.second,
-            dt.microsecond,
-        )
+    @property
+    def closed(self):
+        return not self.file or self.file.closed
 
+    def readable(self):
+        if self.closed:
+            return False
+        if hasattr(self.file, "readable"):
+            return self.file.readable()
+        return True
 
-class BulkInsertMapper:
-    BLOB = "TO_BLOB(%s)"
-    DATE = "TO_DATE(%s)"
-    INTERVAL = "CAST(%s as INTERVAL DAY(9) TO SECOND(6))"
-    NCLOB = "TO_NCLOB(%s)"
-    NUMBER = "TO_NUMBER(%s)"
-    TIMESTAMP = "TO_TIMESTAMP(%s)"
+    def writable(self):
+        if self.closed:
+            return False
+        if hasattr(self.file, "writable"):
+            return self.file.writable()
+        return "w" in getattr(self.file, "mode", "")
 
-    types = {
-        "AutoField": NUMBER,
-        "BigAutoField": NUMBER,
-        "BigIntegerField": NUMBER,
-        "BinaryField": BLOB,
-        "BooleanField": NUMBER,
-        "DateField": DATE,
-        "DateTimeField": TIMESTAMP,
-        "DecimalField": NUMBER,
-        "DurationField": INTERVAL,
-        "FloatField": NUMBER,
-        "IntegerField": NUMBER,
-        "PositiveBigIntegerField": NUMBER,
-        "PositiveIntegerField": NUMBER,
-        "PositiveSmallIntegerField": NUMBER,
-        "SmallAutoField": NUMBER,
-        "SmallIntegerField": NUMBER,
-        "TextField": NCLOB,
-        "TimeField": TIMESTAMP,
-    }
+    def seekable(self):
+        if self.closed:
+            return False
+        if hasattr(self.file, "seekable"):
+            return self.file.seekable()
+        return True
 
-
-def dsn(settings_dict):
-    if settings_dict["PORT"]:
-        host = settings_dict["HOST"].strip() or "localhost"
-        return Database.makedsn(host, int(settings_dict["PORT"]), settings_dict["NAME"])
-    return settings_dict["NAME"]
+    def __iter__(self):
+        return iter(self.file)

@@ -1,124 +1,114 @@
-from django.db import NotSupportedError
-from django.db.models.expressions import Func, Value
-from django.db.models.fields import TextField
-from django.db.models.fields.json import JSONField
-from django.db.models.functions import Cast
+"""
+Serialize data to/from JSON
+"""
+
+import datetime
+import decimal
+import json
+import uuid
+
+from django.core.serializers.base import DeserializationError
+from django.core.serializers.python import Deserializer as PythonDeserializer
+from django.core.serializers.python import Serializer as PythonSerializer
+from django.utils.duration import duration_iso_string
+from django.utils.functional import Promise
+from django.utils.timezone import is_aware
 
 
-class JSONArray(Func):
-    function = "JSON_ARRAY"
-    output_field = JSONField()
+class Serializer(PythonSerializer):
+    """Convert a queryset to JSON."""
 
-    def as_sql(self, compiler, connection, **extra_context):
-        if not connection.features.supports_json_field:
-            raise NotSupportedError(
-                "JSONFields are not supported on this database backend."
-            )
-        return super().as_sql(compiler, connection, **extra_context)
+    internal_use_only = False
 
-    def as_native(self, compiler, connection, *, returning, **extra_context):
-        # PostgreSQL 16+ and Oracle remove SQL NULL values from the array by
-        # default. Adds the NULL ON NULL clause to keep NULL values in the
-        # array, mapping them to JSON null values, which matches the behavior
-        # of SQLite.
-        null_on_null = "NULL ON NULL" if len(self.get_source_expressions()) > 0 else ""
+    def _init_options(self):
+        self._current = None
+        self.json_kwargs = self.options.copy()
+        self.json_kwargs.pop("stream", None)
+        self.json_kwargs.pop("fields", None)
+        if self.options.get("indent"):
+            # Prevent trailing spaces
+            self.json_kwargs["separators"] = (",", ": ")
+        self.json_kwargs.setdefault("cls", DjangoJSONEncoder)
+        self.json_kwargs.setdefault("ensure_ascii", False)
 
-        return self.as_sql(
-            compiler,
-            connection,
-            template=(
-                f"%(function)s(%(expressions)s {null_on_null} RETURNING {returning})"
-            ),
-            **extra_context,
-        )
+    def start_serialization(self):
+        self._init_options()
+        self.stream.write("[")
 
-    def as_postgresql(self, compiler, connection, **extra_context):
-        # Casting source expressions is only required using JSONB_BUILD_ARRAY
-        # or when using JSON_ARRAY on PostgreSQL 16+ with server-side bindings.
-        # This is done in all cases for consistency.
-        casted_obj = self.copy()
-        casted_obj.set_source_expressions(
-            [
-                (
-                    # Conditional Cast to avoid unnecessary wrapping.
-                    expression
-                    if isinstance(expression, Cast)
-                    else Cast(expression, expression.output_field)
-                )
-                for expression in casted_obj.get_source_expressions()
-            ]
-        )
+    def end_serialization(self):
+        if self.options.get("indent"):
+            self.stream.write("\n")
+        self.stream.write("]")
+        if self.options.get("indent"):
+            self.stream.write("\n")
 
-        if connection.features.is_postgresql_16:
-            return casted_obj.as_native(
-                compiler, connection, returning="JSONB", **extra_context
-            )
+    def end_object(self, obj):
+        # self._current has the field data
+        indent = self.options.get("indent")
+        if not self.first:
+            self.stream.write(",")
+            if not indent:
+                self.stream.write(" ")
+        if indent:
+            self.stream.write("\n")
+        json.dump(self.get_dump_object(obj), self.stream, **self.json_kwargs)
+        self._current = None
 
-        return casted_obj.as_sql(
-            compiler,
-            connection,
-            function="JSONB_BUILD_ARRAY",
-            **extra_context,
-        )
-
-    def as_oracle(self, compiler, connection, **extra_context):
-        return self.as_native(compiler, connection, returning="CLOB", **extra_context)
+    def getvalue(self):
+        # Grandparent super
+        return super(PythonSerializer, self).getvalue()
 
 
-class JSONObject(Func):
-    function = "JSON_OBJECT"
-    output_field = JSONField()
+class Deserializer(PythonDeserializer):
+    """Deserialize a stream or string of JSON data."""
 
-    def __init__(self, **fields):
-        expressions = []
-        for key, value in fields.items():
-            expressions.extend((Value(key), value))
-        super().__init__(*expressions)
+    def __init__(self, stream_or_string, **options):
+        if not isinstance(stream_or_string, (bytes, str)):
+            stream_or_string = stream_or_string.read()
+        if isinstance(stream_or_string, bytes):
+            stream_or_string = stream_or_string.decode()
+        try:
+            objects = json.loads(stream_or_string)
+        except Exception as exc:
+            raise DeserializationError() from exc
+        super().__init__(objects, **options)
 
-    def as_sql(self, compiler, connection, **extra_context):
-        if not connection.features.has_json_object_function:
-            raise NotSupportedError(
-                "JSONObject() is not supported on this database backend."
-            )
-        return super().as_sql(compiler, connection, **extra_context)
+    def _handle_object(self, obj):
+        try:
+            yield from super()._handle_object(obj)
+        except (GeneratorExit, DeserializationError):
+            raise
+        except Exception as exc:
+            raise DeserializationError(f"Error deserializing object: {exc}") from exc
 
-    def join(self, args):
-        pairs = zip(args[::2], args[1::2], strict=True)
-        # Wrap 'key' in parentheses in case of postgres cast :: syntax.
-        return ", ".join([f"({key}) VALUE {value}" for key, value in pairs])
 
-    def as_native(self, compiler, connection, *, returning, **extra_context):
-        return self.as_sql(
-            compiler,
-            connection,
-            arg_joiner=self,
-            template=f"%(function)s(%(expressions)s RETURNING {returning})",
-            **extra_context,
-        )
+class DjangoJSONEncoder(json.JSONEncoder):
+    """
+    JSONEncoder subclass that knows how to encode date/time, decimal types, and
+    UUIDs.
+    """
 
-    def as_postgresql(self, compiler, connection, **extra_context):
-        # Casting keys to text is only required when using JSONB_BUILD_OBJECT
-        # or when using JSON_OBJECT on PostgreSQL 16+ with server-side bindings.
-        # This is done in all cases for consistency.
-        copy = self.copy()
-        copy.set_source_expressions(
-            [
-                Cast(expression, TextField()) if index % 2 == 0 else expression
-                for index, expression in enumerate(copy.get_source_expressions())
-            ]
-        )
-
-        if connection.features.is_postgresql_16:
-            return copy.as_native(
-                compiler, connection, returning="JSONB", **extra_context
-            )
-
-        return super(JSONObject, copy).as_sql(
-            compiler,
-            connection,
-            function="JSONB_BUILD_OBJECT",
-            **extra_context,
-        )
-
-    def as_oracle(self, compiler, connection, **extra_context):
-        return self.as_native(compiler, connection, returning="CLOB", **extra_context)
+    def default(self, o):
+        # See "Date Time String Format" in the ECMA-262 specification.
+        if isinstance(o, datetime.datetime):
+            r = o.isoformat()
+            if o.microsecond:
+                r = r[:23] + r[26:]
+            if r.endswith("+00:00"):
+                r = r.removesuffix("+00:00") + "Z"
+            return r
+        elif isinstance(o, datetime.date):
+            return o.isoformat()
+        elif isinstance(o, datetime.time):
+            if is_aware(o):
+                raise ValueError("JSON can't represent timezone-aware times.")
+            r = o.isoformat()
+            if o.microsecond:
+                r = r[:12]
+            return r
+        elif isinstance(o, datetime.timedelta):
+            return duration_iso_string(o)
+        elif isinstance(o, (decimal.Decimal, uuid.UUID, Promise)):
+            return str(o)
+        else:
+            return super().default(o)

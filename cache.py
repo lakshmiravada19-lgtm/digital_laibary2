@@ -1,100 +1,241 @@
-from django.core.cache import InvalidCacheBackendError, caches
-from django.core.cache.utils import make_template_fragment_key
-from django.template import Library, Node, TemplateSyntaxError, VariableDoesNotExist
+"""
+Cache middleware. If enabled, each Django-powered page will be cached based on
+URL. The canonical way to enable cache middleware is to set
+``UpdateCacheMiddleware`` as your first piece of middleware, and
+``FetchFromCacheMiddleware`` as the last::
 
-register = Library()
+    MIDDLEWARE = [
+        'django.middleware.cache.UpdateCacheMiddleware',
+        ...
+        'django.middleware.cache.FetchFromCacheMiddleware'
+    ]
+
+This is counterintuitive, but correct: ``UpdateCacheMiddleware`` needs to run
+last during the response phase, which processes middleware bottom-up;
+``FetchFromCacheMiddleware`` needs to run last during the request phase, which
+processes middleware top-down.
+
+The single-class ``CacheMiddleware`` can be used for some simple sites.
+However, if any other piece of middleware needs to affect the cache key, you'll
+need to use the two-part ``UpdateCacheMiddleware`` and
+``FetchFromCacheMiddleware``. This'll most often happen when you're using
+Django's ``LocaleMiddleware``.
+
+More details about how the caching works:
+
+* Only GET or HEAD-requests with status code 200 are cached.
+
+* The number of seconds each page is stored for is set by the "max-age" section
+  of the response's "Cache-Control" header, falling back to the
+  CACHE_MIDDLEWARE_SECONDS setting if the section was not found.
+
+* This middleware expects that a HEAD request is answered with the same response
+  headers exactly like the corresponding GET request.
+
+* When a hit occurs, a shallow copy of the original response object is returned
+  from process_request.
+
+* Pages will be cached based on the contents of the request headers listed in
+  the response's "Vary" header.
+
+* This middleware also sets ETag, Last-Modified, Expires and Cache-Control
+  headers on the response object.
+
+* If the request had an Authorization header and the response was not marked
+  "Cache-Control: public", the response will vary on Authorization.
+"""
+
+import time
+
+from django.conf import settings
+from django.core.cache import DEFAULT_CACHE_ALIAS, caches
+from django.utils.cache import (
+    get_cache_key,
+    get_max_age,
+    has_vary_header,
+    learn_cache_key,
+    patch_response_headers,
+    patch_vary_headers,
+)
+from django.utils.deprecation import MiddlewareMixin
+from django.utils.http import parse_http_date_safe
 
 
-class CacheNode(Node):
-    def __init__(self, nodelist, expire_time_var, fragment_name, vary_on, cache_name):
-        self.nodelist = nodelist
-        self.expire_time_var = expire_time_var
-        self.fragment_name = fragment_name
-        self.vary_on = vary_on
-        self.cache_name = cache_name
+class UpdateCacheMiddleware(MiddlewareMixin):
+    """
+    Response-phase cache middleware that updates the cache if the response is
+    cacheable.
 
-    def render(self, context):
-        try:
-            expire_time = self.expire_time_var.resolve(context)
-        except VariableDoesNotExist:
-            raise TemplateSyntaxError(
-                '"cache" tag got an unknown variable: %r' % self.expire_time_var.var
+    Must be used as part of the two-part update/fetch cache middleware.
+    UpdateCacheMiddleware must be the first piece of middleware in MIDDLEWARE
+    so that it'll get called last during the response phase.
+    """
+
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self.cache_timeout = settings.CACHE_MIDDLEWARE_SECONDS
+        self.page_timeout = None
+        self.key_prefix = settings.CACHE_MIDDLEWARE_KEY_PREFIX
+        self.cache_alias = settings.CACHE_MIDDLEWARE_ALIAS
+
+    @property
+    def cache(self):
+        return caches[self.cache_alias]
+
+    def _should_update_cache(self, request, response):
+        return hasattr(request, "_cache_update_cache") and request._cache_update_cache
+
+    def process_response(self, request, response):
+        """Set the cache, if needed."""
+        if not self._should_update_cache(request, response):
+            # We don't need to update the cache, just return.
+            return response
+
+        if response.streaming or response.status_code not in (200, 304):
+            return response
+
+        # Don't cache responses that set a user-specific (and maybe security
+        # sensitive) cookie while varying on Cookie.
+        if response.cookies and has_vary_header(response, "Cookie"):
+            return response
+
+        # Don't cache responses when the Cache-Control header is set to
+        # private, no-cache, or no-store.
+        cache_control = response.get("Cache-Control", "").lower()
+        if cache_control and any(
+            directive in cache_control
+            for directive in (
+                "private",
+                "no-cache",
+                "no-store",
             )
-        if expire_time is not None:
-            try:
-                expire_time = int(expire_time)
-            except (ValueError, TypeError):
-                raise TemplateSyntaxError(
-                    '"cache" tag got a non-integer timeout value: %r' % expire_time
-                )
-        if self.cache_name:
-            try:
-                cache_name = self.cache_name.resolve(context)
-            except VariableDoesNotExist:
-                raise TemplateSyntaxError(
-                    '"cache" tag got an unknown variable: %r' % self.cache_name.var
-                )
-            try:
-                fragment_cache = caches[cache_name]
-            except InvalidCacheBackendError:
-                raise TemplateSyntaxError(
-                    "Invalid cache name specified for cache tag: %r" % cache_name
-                )
-        else:
-            try:
-                fragment_cache = caches["template_fragments"]
-            except InvalidCacheBackendError:
-                fragment_cache = caches["default"]
+        ):
+            return response
 
-        vary_on = [var.resolve(context) for var in self.vary_on]
-        cache_key = make_template_fragment_key(self.fragment_name, vary_on)
-        value = fragment_cache.get(cache_key)
-        if value is None:
-            value = self.nodelist.render(context)
-            fragment_cache.set(cache_key, value, expire_time)
-        return value
+        # Don't cache responses when the Vary header contains '*'.
+        if has_vary_header(response, "*"):
+            return response
+
+        # Page timeout takes precedence over the "max-age" and the default
+        # cache timeout.
+        timeout = self.page_timeout
+        if timeout is None:
+            # The timeout from the "max-age" section of the "Cache-Control"
+            # header takes precedence over the default cache timeout.
+            timeout = get_max_age(response)
+            if timeout is None:
+                timeout = self.cache_timeout
+            elif timeout == 0:
+                # max-age was set to 0, don't cache.
+                return response
+        patch_response_headers(response, timeout)
+        # Make the response vary on Authorization if the request bears that
+        # header, unless allowed by "public" per RFC 9111, Section 3.5. No
+        # exceptions are made for "s-maxage" and "must-revalidate" since these
+        # are not currently implemented by Django.
+        if request.headers.get("Authorization") and "public" not in cache_control:
+            patch_vary_headers(response, ("Authorization",))
+        if timeout and response.status_code == 200:
+            cache_key = learn_cache_key(
+                request, response, timeout, self.key_prefix, cache=self.cache
+            )
+            if hasattr(response, "render") and callable(response.render):
+                response.add_post_render_callback(
+                    lambda r: self.cache.set(cache_key, r, timeout)
+                )
+            else:
+                self.cache.set(cache_key, response, timeout)
+        return response
 
 
-@register.tag("cache")
-def do_cache(parser, token):
+class FetchFromCacheMiddleware(MiddlewareMixin):
     """
-    This will cache the contents of a template fragment for a given amount
-    of time.
+    Request-phase cache middleware that fetches a page from the cache.
 
-    Usage::
-
-        {% load cache %}
-        {% cache [expire_time] [fragment_name] %}
-            .. some expensive processing ..
-        {% endcache %}
-
-    This tag also supports varying by a list of arguments::
-
-        {% load cache %}
-        {% cache [expire_time] [fragment_name] [var1] [var2] .. %}
-            .. some expensive processing ..
-        {% endcache %}
-
-    Optionally the cache to use may be specified thus::
-
-        {% cache ....  using="cachename" %}
-
-    Each unique set of arguments will result in a unique cache entry.
+    Must be used as part of the two-part update/fetch cache middleware.
+    FetchFromCacheMiddleware must be the last piece of middleware in MIDDLEWARE
+    so that it'll get called last during the request phase.
     """
-    nodelist = parser.parse(("endcache",))
-    parser.delete_first_token()
-    tokens = token.split_contents()
-    if len(tokens) < 3:
-        raise TemplateSyntaxError("'%r' tag requires at least 2 arguments." % tokens[0])
-    if len(tokens) > 3 and tokens[-1].startswith("using="):
-        cache_name = parser.compile_filter(tokens[-1].removeprefix("using="))
-        tokens = tokens[:-1]
-    else:
-        cache_name = None
-    return CacheNode(
-        nodelist,
-        parser.compile_filter(tokens[1]),
-        tokens[2],  # fragment_name can't be a variable.
-        [parser.compile_filter(t) for t in tokens[3:]],
-        cache_name,
-    )
+
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self.key_prefix = settings.CACHE_MIDDLEWARE_KEY_PREFIX
+        self.cache_alias = settings.CACHE_MIDDLEWARE_ALIAS
+
+    @property
+    def cache(self):
+        return caches[self.cache_alias]
+
+    def process_request(self, request):
+        """
+        Check whether the page is already cached and return the cached
+        version if available.
+        """
+        if request.method not in ("GET", "HEAD"):
+            request._cache_update_cache = False
+            return None  # Don't bother checking the cache.
+
+        # try and get the cached GET response
+        cache_key = get_cache_key(request, self.key_prefix, "GET", cache=self.cache)
+        if cache_key is None:
+            request._cache_update_cache = True
+            return None  # No cache information available, need to rebuild.
+        response = self.cache.get(cache_key)
+        # if it wasn't found and we are looking for a HEAD, try looking just for that
+        if response is None and request.method == "HEAD":
+            cache_key = get_cache_key(
+                request, self.key_prefix, "HEAD", cache=self.cache
+            )
+            response = self.cache.get(cache_key)
+
+        if response is None:
+            request._cache_update_cache = True
+            return None  # No cache information available, need to rebuild.
+
+        # Derive the age estimation of the cached response.
+        if (max_age_seconds := get_max_age(response)) is not None and (
+            expires_timestamp := parse_http_date_safe(response["Expires"])
+        ) is not None:
+            now_timestamp = int(time.time())
+            remaining_seconds = expires_timestamp - now_timestamp
+            # Use Age: 0 if local clock got turned back.
+            response["Age"] = max(0, max_age_seconds - remaining_seconds)
+
+        # hit, return cached response
+        request._cache_update_cache = False
+        return response
+
+
+class CacheMiddleware(UpdateCacheMiddleware, FetchFromCacheMiddleware):
+    """
+    Cache middleware that provides basic behavior for many simple sites.
+
+    Also used as the hook point for the cache decorator, which is generated
+    using the decorator-from-middleware utility.
+    """
+
+    def __init__(self, get_response, cache_timeout=None, page_timeout=None, **kwargs):
+        super().__init__(get_response)
+        # We need to differentiate between "provided, but using default value",
+        # and "not provided". If the value is provided using a default, then
+        # we fall back to system defaults. If it is not provided at all,
+        # we need to use middleware defaults.
+
+        try:
+            key_prefix = kwargs["key_prefix"]
+            if key_prefix is None:
+                key_prefix = ""
+            self.key_prefix = key_prefix
+        except KeyError:
+            pass
+        try:
+            cache_alias = kwargs["cache_alias"]
+            if cache_alias is None:
+                cache_alias = DEFAULT_CACHE_ALIAS
+            self.cache_alias = cache_alias
+        except KeyError:
+            pass
+
+        if cache_timeout is not None:
+            self.cache_timeout = cache_timeout
+        self.page_timeout = page_timeout

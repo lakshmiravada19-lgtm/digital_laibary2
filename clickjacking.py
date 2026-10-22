@@ -1,90 +1,48 @@
-from functools import wraps
+"""
+Clickjacking Protection Middleware.
 
-from asgiref.sync import iscoroutinefunction
+This module provides a middleware that implements protection against a
+malicious site loading resources from your site in a hidden frame.
+"""
+
+from django.conf import settings
+from django.utils.deprecation import MiddlewareMixin
 
 
-def xframe_options_deny(view_func):
+class XFrameOptionsMiddleware(MiddlewareMixin):
     """
-    Modify a view function so its response has the X-Frame-Options HTTP
-    header set to 'DENY' as long as the response doesn't already have that
-    header set. Usage:
+    Set the X-Frame-Options HTTP header in HTTP responses.
 
-    @xframe_options_deny
-    def some_view(request):
-        ...
-    """
+    Do not set the header if it's already set or if the response contains
+    a xframe_options_exempt value set to True.
 
-    if iscoroutinefunction(view_func):
-
-        async def _view_wrapper(*args, **kwargs):
-            response = await view_func(*args, **kwargs)
-            if response.get("X-Frame-Options") is None:
-                response["X-Frame-Options"] = "DENY"
-            return response
-
-    else:
-
-        def _view_wrapper(*args, **kwargs):
-            response = view_func(*args, **kwargs)
-            if response.get("X-Frame-Options") is None:
-                response["X-Frame-Options"] = "DENY"
-            return response
-
-    return wraps(view_func)(_view_wrapper)
-
-
-def xframe_options_sameorigin(view_func):
-    """
-    Modify a view function so its response has the X-Frame-Options HTTP
-    header set to 'SAMEORIGIN' as long as the response doesn't already have
-    that header set. Usage:
-
-    @xframe_options_sameorigin
-    def some_view(request):
-        ...
+    By default, set the X-Frame-Options header to 'DENY', meaning the response
+    cannot be displayed in a frame, regardless of the site attempting to do so.
+    To enable the response to be loaded on a frame within the same site, set
+    X_FRAME_OPTIONS in your project's Django settings to 'SAMEORIGIN'.
     """
 
-    if iscoroutinefunction(view_func):
-
-        async def _view_wrapper(*args, **kwargs):
-            response = await view_func(*args, **kwargs)
-            if response.get("X-Frame-Options") is None:
-                response["X-Frame-Options"] = "SAMEORIGIN"
+    def process_response(self, request, response):
+        # Don't set it if it's already in the response
+        if response.get("X-Frame-Options") is not None:
             return response
 
-    else:
-
-        def _view_wrapper(*args, **kwargs):
-            response = view_func(*args, **kwargs)
-            if response.get("X-Frame-Options") is None:
-                response["X-Frame-Options"] = "SAMEORIGIN"
+        # Don't set it if they used @xframe_options_exempt
+        if getattr(response, "xframe_options_exempt", False):
             return response
 
-    return wraps(view_func)(_view_wrapper)
+        response.headers["X-Frame-Options"] = self.get_xframe_options_value(
+            request,
+            response,
+        )
+        return response
 
+    def get_xframe_options_value(self, request, response):
+        """
+        Get the value to set for the X_FRAME_OPTIONS header. Use the value from
+        the X_FRAME_OPTIONS setting, or 'DENY' if not set.
 
-def xframe_options_exempt(view_func):
-    """
-    Modify a view function by setting a response variable that instructs
-    XFrameOptionsMiddleware to NOT set the X-Frame-Options HTTP header. Usage:
-
-    @xframe_options_exempt
-    def some_view(request):
-        ...
-    """
-
-    if iscoroutinefunction(view_func):
-
-        async def _view_wrapper(*args, **kwargs):
-            response = await view_func(*args, **kwargs)
-            response.xframe_options_exempt = True
-            return response
-
-    else:
-
-        def _view_wrapper(*args, **kwargs):
-            response = view_func(*args, **kwargs)
-            response.xframe_options_exempt = True
-            return response
-
-    return wraps(view_func)(_view_wrapper)
+        This method can be overridden if needed, allowing it to vary based on
+        the request or response.
+        """
+        return getattr(settings, "X_FRAME_OPTIONS", "DENY").upper()

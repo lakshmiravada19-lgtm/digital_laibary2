@@ -1,69 +1,99 @@
-import functools
-from collections import namedtuple
+import datetime
+import decimal
+
+from .base import Database
 
 
-def make_model_tuple(model):
+class InsertVar:
     """
-    Take a model or a string of the form "app_label.ModelName" and return a
-    corresponding ("app_label", "modelname") tuple. If a tuple is passed in,
-    assume it's a valid model tuple already and return it unchanged.
+    A late-binding cursor variable that can be passed to Cursor.execute
+    as a parameter, in order to receive the id of the row created by an
+    insert statement.
     """
-    try:
-        if isinstance(model, tuple):
-            model_tuple = model
-        elif isinstance(model, str):
-            app_label, model_name = model.split(".")
-            model_tuple = app_label, model_name.lower()
-        else:
-            model_tuple = model._meta.app_label, model._meta.model_name
-        assert len(model_tuple) == 2
-        return model_tuple
-    except (ValueError, AssertionError):
-        raise ValueError(
-            "Invalid model reference '%s'. String model references "
-            "must be of the form 'app_label.ModelName'." % model
+
+    types = {
+        "AutoField": int,
+        "BigAutoField": int,
+        "SmallAutoField": int,
+        "IntegerField": int,
+        "BigIntegerField": int,
+        "SmallIntegerField": int,
+        "PositiveBigIntegerField": int,
+        "PositiveSmallIntegerField": int,
+        "PositiveIntegerField": int,
+        "BooleanField": int,
+        "FloatField": Database.DB_TYPE_BINARY_DOUBLE,
+        "DateTimeField": Database.DB_TYPE_TIMESTAMP,
+        "DateField": datetime.date,
+        "DecimalField": decimal.Decimal,
+    }
+
+    def __init__(self, field):
+        internal_type = getattr(field, "target_field", field).get_internal_type()
+        self.db_type = self.types.get(internal_type, str)
+        self.bound_param = None
+
+    def bind_parameter(self, cursor):
+        self.bound_param = cursor.cursor.var(self.db_type)
+        return self.bound_param
+
+    def get_value(self):
+        return self.bound_param.getvalue()
+
+
+class Oracle_datetime(datetime.datetime):
+    """
+    A datetime object, with an additional class attribute
+    to tell oracledb to save the microseconds too.
+    """
+
+    input_size = Database.DB_TYPE_TIMESTAMP
+
+    @classmethod
+    def from_datetime(cls, dt):
+        return Oracle_datetime(
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second,
+            dt.microsecond,
         )
 
 
-def resolve_callables(mapping):
-    """
-    Generate key/value pairs for the given mapping where the values are
-    evaluated if they're callable.
-    """
-    for k, v in mapping.items():
-        yield k, v() if callable(v) else v
+class BulkInsertMapper:
+    BLOB = "TO_BLOB(%s)"
+    DATE = "TO_DATE(%s)"
+    INTERVAL = "CAST(%s as INTERVAL DAY(9) TO SECOND(6))"
+    NCLOB = "TO_NCLOB(%s)"
+    NUMBER = "TO_NUMBER(%s)"
+    TIMESTAMP = "TO_TIMESTAMP(%s)"
+
+    types = {
+        "AutoField": NUMBER,
+        "BigAutoField": NUMBER,
+        "BigIntegerField": NUMBER,
+        "BinaryField": BLOB,
+        "BooleanField": NUMBER,
+        "DateField": DATE,
+        "DateTimeField": TIMESTAMP,
+        "DecimalField": NUMBER,
+        "DurationField": INTERVAL,
+        "FloatField": NUMBER,
+        "IntegerField": NUMBER,
+        "PositiveBigIntegerField": NUMBER,
+        "PositiveIntegerField": NUMBER,
+        "PositiveSmallIntegerField": NUMBER,
+        "SmallAutoField": NUMBER,
+        "SmallIntegerField": NUMBER,
+        "TextField": NCLOB,
+        "TimeField": TIMESTAMP,
+    }
 
 
-def unpickle_named_row(names, values):
-    return create_namedtuple_class(*names)(*values)
-
-
-@functools.lru_cache
-def create_namedtuple_class(*names):
-    # Cache type() with @lru_cache since it's too slow to be called for every
-    # QuerySet evaluation.
-    def __reduce__(self):
-        return unpickle_named_row, (names, tuple(self))
-
-    return type(
-        "Row",
-        (namedtuple("Row", names),),
-        {"__reduce__": __reduce__, "__slots__": ()},
-    )
-
-
-class AltersData:
-    """
-    Make subclasses preserve the alters_data attribute on overridden methods.
-    """
-
-    def __init_subclass__(cls, **kwargs):
-        for fn_name, fn in vars(cls).items():
-            if callable(fn) and not hasattr(fn, "alters_data"):
-                for base in cls.__bases__:
-                    if base_fn := getattr(base, fn_name, None):
-                        if hasattr(base_fn, "alters_data"):
-                            fn.alters_data = base_fn.alters_data
-                        break
-
-        super().__init_subclass__(**kwargs)
+def dsn(settings_dict):
+    if settings_dict["PORT"]:
+        host = settings_dict["HOST"].strip() or "localhost"
+        return Database.makedsn(host, int(settings_dict["PORT"]), settings_dict["NAME"])
+    return settings_dict["NAME"]

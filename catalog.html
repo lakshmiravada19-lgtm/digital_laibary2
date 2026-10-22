@@ -1,0 +1,56 @@
+{% extends "library/base.html" %}
+{% block title %}Book Catalog | Digital Library{% endblock %}
+{% block content %}
+<section class="catalog-hero rounded-4 p-4 p-lg-5 mb-4">
+  <div class="row align-items-center g-4">
+    <div class="col-lg-7">
+      <span class="eyebrow">READ. DISCOVER. RETURN.</span>
+      <h1 class="display-5 fw-bold mt-2 mb-3">A good book is always within reach.</h1>
+      <p class="lead mb-0">Explore the collection and find your next read.</p>
+    </div>
+    <div class="col-lg-5">
+      <label class="form-label fw-semibold" for="bookSearch">Search the catalog</label>
+      <form method="get" action="{% url 'catalog' %}" role="search">
+        <div class="input-group input-group-lg">
+          <input id="bookSearch" class="form-control" name="q" value="{{ query }}" placeholder="Title, author, genre or ISBN" autocomplete="off" data-live-search>
+          <button class="btn btn-warning fw-semibold" type="submit">Search</button>
+        </div>
+      </form>
+      <p class="small mt-2 mb-0 opacity-75">Results update as you type.</p>
+    </div>
+  </div>
+</section>
+<div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mb-3">
+  <div><h2 class="h3 fw-bold mb-1">Library collection</h2><p class="text-secondary mb-0">Search books by title, author, genre or ISBN.</p></div>
+  <span class="badge text-bg-light border">{{ books|length }} title{{ books|length|pluralize }}</span>
+</div>
+<div class="row g-4" id="bookGrid">
+  {% for book in books %}
+    <div class="col-sm-6 col-lg-4 col-xl-3 book-card" data-book-search="{{ book.title|lower }} {{ book.author.name|lower }} {{ book.genre|lower }} {{ book.isbn|lower }}">
+      <article class="card h-100 border-0 shadow-sm overflow-hidden">
+        {% if book.cover_url %}
+          <img class="book-cover card-img-top" src="{{ book.cover_url }}" alt="Cover of {{ book.title }}" loading="lazy">
+        {% else %}
+          <div class="book-cover cover-placeholder" aria-label="No cover available"><span>📖</span><small>{{ book.genre }}</small></div>
+        {% endif %}
+        <div class="card-body d-flex flex-column">
+          <div class="d-flex justify-content-between gap-2 align-items-start mb-2">
+            <span class="badge text-bg-light border">{{ book.genre }}</span>
+            {% if book.available_copies %}
+              <span class="badge rounded-pill text-bg-success">{{ book.available_copies }} available</span>
+            {% else %}
+              <span class="badge rounded-pill text-bg-secondary">Currently unavailable</span>
+            {% endif %}
+          </div>
+          <h3 class="h5 fw-bold">{{ book.title }}</h3>
+          <p class="text-secondary mb-2">by {{ book.author.name }}</p>
+          <p class="small text-secondary mt-auto mb-0">ISBN {{ book.isbn }}</p>
+        </div>
+      </article>
+    </div>
+  {% empty %}
+    <div class="col-12"><div class="empty-state"><h3 class="h5">No titles found</h3><p class="mb-0">Try another search or add books through the admin site.</p></div></div>
+  {% endfor %}
+  <div class="col-12 d-none" id="noLiveResults"><div class="empty-state"><h3 class="h5">No matching titles</h3><p class="mb-0">Try another title, author, genre or ISBN.</p></div></div>
+</div>
+{% endblock %}

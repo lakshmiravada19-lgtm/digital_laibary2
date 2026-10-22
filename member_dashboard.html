@@ -1,0 +1,39 @@
+{% extends "library/base.html" %}
+{% block title %}My Library | Digital Library{% endblock %}
+{% block content %}
+<div class="mb-4">
+  <span class="eyebrow">MEMBER DASHBOARD</span>
+  <h1 class="h2 fw-bold mt-2">Welcome{% if member %}, {{ member.name }}{% endif %}</h1>
+  {% if member %}<p class="text-secondary mb-0">Member ID {{ member.member_id }} · Joined {{ member.joined_date|date:"M Y" }}</p>{% endif %}
+</div>
+{% if not member %}
+  <div class="alert alert-info">Your account is not linked to a library member record yet. Ask library staff to connect your account in the admin site.</div>
+{% else %}
+  <section class="card border-0 shadow-sm">
+    <div class="card-body p-4">
+      <h2 class="h5 fw-bold mb-3">Borrowing history</h2>
+      {% if records %}
+        <div class="table-responsive">
+          <table class="table align-middle">
+            <thead><tr><th>Book</th><th>Issued</th><th>Due</th><th>Returned</th><th>Fine</th><th>Status</th></tr></thead>
+            <tbody>
+              {% for record in records %}
+                <tr>
+                  <td><strong>{{ record.book.title }}</strong><small class="d-block text-secondary">{{ record.book.author.name }}</small></td>
+                  <td>{{ record.issue_date|date:"M j, Y" }}</td>
+                  <td>{% if not record.returned and record.due_date < today %}<span class="text-danger fw-semibold">{% endif %}{{ record.due_date|date:"M j, Y" }}{% if not record.returned and record.due_date < today %} · overdue</span>{% endif %}</td>
+                  <td>{{ record.return_date|date:"M j, Y"|default:"—" }}</td>
+                  <td>₹{{ record.fine_amount }}</td>
+                  <td>{% if record.returned %}<span class="badge text-bg-success">Returned</span>{% elif record.due_date < today %}<span class="badge text-bg-danger">Overdue</span>{% else %}<span class="badge text-bg-warning">Borrowed</span>{% endif %}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state"><p class="mb-0">You don't have any borrowing activity yet.</p></div>
+      {% endif %}
+    </div>
+  </section>
+{% endif %}
+{% endblock %}

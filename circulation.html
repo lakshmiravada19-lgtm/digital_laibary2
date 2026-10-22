@@ -1,0 +1,63 @@
+{% extends "library/base.html" %}
+{% block title %}Circulation | Digital Library{% endblock %}
+{% block content %}
+<div class="mb-4">
+  <span class="eyebrow">STAFF WORKSPACE</span>
+  <h1 class="h2 fw-bold mt-2">Book circulation</h1>
+  <p class="text-secondary mb-0">Issue available books, track due dates and process returns. Overdue fines are ₹5 per day.</p>
+</div>
+<div class="row g-4">
+  <div class="col-lg-4">
+    <section class="card border-0 shadow-sm">
+      <div class="card-body p-4">
+        <h2 class="h5 fw-bold">Issue a book</h2>
+        <p class="small text-secondary">The due date is set to 14 days after issue.</p>
+        <form method="post" novalidate>
+          {% csrf_token %}
+          {% for field in form %}
+            <div class="mb-3">
+              <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+              {{ field }}
+              {% for error in field.errors %}<div class="invalid-feedback d-block">{{ error }}</div>{% endfor %}
+            </div>
+          {% endfor %}
+          {% if form.non_field_errors %}<div class="alert alert-danger">{{ form.non_field_errors }}</div>{% endif %}
+          <p class="small text-secondary" data-due-preview>Choose a book to preview the due date.</p>
+          <button class="btn btn-primary w-100" type="submit">Issue book</button>
+        </form>
+      </div>
+    </section>
+  </div>
+  <div class="col-lg-8">
+    <section class="card border-0 shadow-sm">
+      <div class="card-body p-4">
+        <div class="d-flex justify-content-between align-items-center mb-3"><h2 class="h5 fw-bold mb-0">Currently borrowed</h2><span class="badge text-bg-light border">{{ active_records|length }} active</span></div>
+        {% if active_records %}
+          <div class="table-responsive">
+            <table class="table align-middle">
+              <thead><tr><th>Book / Member</th><th>Issued</th><th>Due</th><th></th></tr></thead>
+              <tbody>
+                {% for record in active_records %}
+                  <tr>
+                    <td><strong>{{ record.book.title }}</strong><small class="d-block text-secondary">{{ record.member.name }} · {{ record.member.member_id }}</small></td>
+                    <td>{{ record.issue_date|date:"M j, Y" }}</td>
+                    <td>{% if record.due_date < today %}<span class="text-danger fw-semibold">{% else %}<span>{% endif %}{{ record.due_date|date:"M j, Y" }}</span></td>
+                    <td>
+                      <form method="post" action="{% url 'return_book' record.pk %}">
+                        {% csrf_token %}
+                        <button class="btn btn-sm btn-outline-primary" type="submit">Return</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="empty-state py-5"><p class="mb-0">There are no books currently checked out.</p></div>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

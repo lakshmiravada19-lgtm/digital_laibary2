@@ -1,6 +1,16 @@
-# IANA versions like 2020a are not valid PEP 440 identifiers; the recommended
-# way to translate the version is to use YYYY.n where `n` is a 0-based index.
-__version__ = "2026.5"
+#
+# Copyright (C) 2009-2020 the sqlparse authors and contributors
+# <see AUTHORS file>
+#
+# This module is part of python-sqlparse and is released under
+# the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
-# This exposes the original IANA version number.
-IANA_VERSION = "2026e"
+from sqlparse.engine import grouping
+from sqlparse.engine.filter_stack import FilterStack
+from sqlparse.engine.statement_splitter import StatementSplitter
+
+__all__ = [
+    'FilterStack',
+    'StatementSplitter',
+    'grouping',
+]

@@ -1,14 +1,14 @@
-import django.contrib.sites.models
-from django.contrib.sites.models import _simple_domain_name_validator
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-    dependencies = []
+    dependencies = [
+        ("sites", "0001_initial"),
+    ]
 
     operations = [
         migrations.CreateModel(
-            name="Site",
+            name="Redirect",
             fields=[
                 (
                     "id",
@@ -20,24 +20,45 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 (
-                    "domain",
-                    models.CharField(
-                        max_length=100,
-                        verbose_name="domain name",
-                        validators=[_simple_domain_name_validator],
+                    "site",
+                    models.ForeignKey(
+                        to="sites.Site",
+                        on_delete=models.CASCADE,
+                        verbose_name="site",
                     ),
                 ),
-                ("name", models.CharField(max_length=50, verbose_name="display name")),
+                (
+                    "old_path",
+                    models.CharField(
+                        help_text=(
+                            "This should be an absolute path, excluding the domain "
+                            "name. Example: “/events/search/”."
+                        ),
+                        max_length=200,
+                        verbose_name="redirect from",
+                        db_index=True,
+                    ),
+                ),
+                (
+                    "new_path",
+                    models.CharField(
+                        help_text=(
+                            "This can be either an absolute path (as above) or a full "
+                            "URL starting with “http://”."
+                        ),
+                        max_length=200,
+                        verbose_name="redirect to",
+                        blank=True,
+                    ),
+                ),
             ],
             options={
-                "ordering": ["domain"],
-                "db_table": "django_site",
-                "verbose_name": "site",
-                "verbose_name_plural": "sites",
+                "ordering": ["old_path"],
+                "unique_together": {("site", "old_path")},
+                "db_table": "django_redirect",
+                "verbose_name": "redirect",
+                "verbose_name_plural": "redirects",
             },
             bases=(models.Model,),
-            managers=[
-                ("objects", django.contrib.sites.models.SiteManager()),
-            ],
         ),
     ]

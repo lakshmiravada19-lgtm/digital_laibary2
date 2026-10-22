@@ -1,283 +1,523 @@
+import logging
+import string
+from datetime import datetime, timedelta
+
+from asgiref.sync import sync_to_async
+
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
+from django.core import signing
+from django.utils import timezone
+from django.utils.crypto import get_random_string
+from django.utils.module_loading import import_string
 
-from .. import Error, Tags, Warning, register
-
-CROSS_ORIGIN_OPENER_POLICY_VALUES = {
-    "same-origin",
-    "same-origin-allow-popups",
-    "unsafe-none",
-}
-REFERRER_POLICY_VALUES = {
-    "no-referrer",
-    "no-referrer-when-downgrade",
-    "origin",
-    "origin-when-cross-origin",
-    "same-origin",
-    "strict-origin",
-    "strict-origin-when-cross-origin",
-    "unsafe-url",
-}
-
-SECRET_KEY_INSECURE_PREFIX = "django-insecure-"
-SECRET_KEY_MIN_LENGTH = 50
-SECRET_KEY_MIN_UNIQUE_CHARACTERS = 5
-
-SECRET_KEY_WARNING_MSG = (
-    f"Your %s has less than {SECRET_KEY_MIN_LENGTH} characters, less than "
-    f"{SECRET_KEY_MIN_UNIQUE_CHARACTERS} unique characters, or it's prefixed "
-    f"with '{SECRET_KEY_INSECURE_PREFIX}' indicating that it was generated "
-    f"automatically by Django. Please generate a long and random value, "
-    f"otherwise many of Django's security-critical features will be "
-    f"vulnerable to attack."
-)
-
-W001 = Warning(
-    "You do not have 'django.middleware.security.SecurityMiddleware' "
-    "in your MIDDLEWARE so the SECURE_HSTS_SECONDS, "
-    "SECURE_CONTENT_TYPE_NOSNIFF, SECURE_REFERRER_POLICY, "
-    "SECURE_CROSS_ORIGIN_OPENER_POLICY, and SECURE_SSL_REDIRECT settings will "
-    "have no effect.",
-    id="security.W001",
-)
-
-W002 = Warning(
-    "You do not have "
-    "'django.middleware.clickjacking.XFrameOptionsMiddleware' in your "
-    "MIDDLEWARE, so your pages will not be served with an "
-    "'x-frame-options' header. Unless there is a good reason for your "
-    "site to be served in a frame, you should consider enabling this "
-    "header to help prevent clickjacking attacks.",
-    id="security.W002",
-)
-
-W004 = Warning(
-    "You have not set a value for the SECURE_HSTS_SECONDS setting. "
-    "If your entire site is served only over SSL, you may want to consider "
-    "setting a value and enabling HTTP Strict Transport Security. "
-    "Be sure to read the documentation first; enabling HSTS carelessly "
-    "can cause serious, irreversible problems.",
-    id="security.W004",
-)
-
-W005 = Warning(
-    "You have not set the SECURE_HSTS_INCLUDE_SUBDOMAINS setting to True. "
-    "Without this, your site is potentially vulnerable to attack "
-    "via an insecure connection to a subdomain. Only set this to True if "
-    "you are certain that all subdomains of your domain should be served "
-    "exclusively via SSL.",
-    id="security.W005",
-)
-
-W006 = Warning(
-    "Your SECURE_CONTENT_TYPE_NOSNIFF setting is not set to True, "
-    "so your pages will not be served with an "
-    "'X-Content-Type-Options: nosniff' header. "
-    "You should consider enabling this header to prevent the "
-    "browser from identifying content types incorrectly.",
-    id="security.W006",
-)
-
-W008 = Warning(
-    "Your SECURE_SSL_REDIRECT setting is not set to True. "
-    "Unless your site should be available over both SSL and non-SSL "
-    "connections, you may want to either set this setting True "
-    "or configure a load balancer or reverse-proxy server "
-    "to redirect all connections to HTTPS.",
-    id="security.W008",
-)
-
-W009 = Warning(
-    SECRET_KEY_WARNING_MSG % "SECRET_KEY",
-    id="security.W009",
-)
-
-W018 = Warning(
-    "You should not have DEBUG set to True in deployment.",
-    id="security.W018",
-)
-
-W019 = Warning(
-    "You have "
-    "'django.middleware.clickjacking.XFrameOptionsMiddleware' in your "
-    "MIDDLEWARE, but X_FRAME_OPTIONS is not set to 'DENY'. "
-    "Unless there is a good reason for your site to serve other parts of "
-    "itself in a frame, you should change it to 'DENY'.",
-    id="security.W019",
-)
-
-W020 = Warning(
-    "ALLOWED_HOSTS must not be empty in deployment.",
-    id="security.W020",
-)
-
-W021 = Warning(
-    "You have not set the SECURE_HSTS_PRELOAD setting to True. Without this, "
-    "your site cannot be submitted to the browser preload list.",
-    id="security.W021",
-)
-
-W022 = Warning(
-    "You have not set the SECURE_REFERRER_POLICY setting. Without this, your "
-    "site will not send a Referrer-Policy header. You should consider "
-    "enabling this header to protect user privacy.",
-    id="security.W022",
-)
-
-E023 = Error(
-    "You have set the SECURE_REFERRER_POLICY setting to an invalid value.",
-    hint="Valid values are: {}.".format(", ".join(sorted(REFERRER_POLICY_VALUES))),
-    id="security.E023",
-)
-
-E024 = Error(
-    "You have set the SECURE_CROSS_ORIGIN_OPENER_POLICY setting to an invalid "
-    "value.",
-    hint="Valid values are: {}.".format(
-        ", ".join(sorted(CROSS_ORIGIN_OPENER_POLICY_VALUES)),
-    ),
-    id="security.E024",
-)
-
-W025 = Warning(SECRET_KEY_WARNING_MSG, id="security.W025")
+# session_key should not be case sensitive because some backends can store it
+# on case insensitive file systems.
+VALID_KEY_CHARS = string.ascii_lowercase + string.digits
 
 
-def _security_middleware():
-    return "django.middleware.security.SecurityMiddleware" in settings.MIDDLEWARE
+class CreateError(Exception):
+    """
+    Used internally as a consistent exception type to catch from save (see the
+    docstring for SessionBase.save() for details).
+    """
+
+    pass
 
 
-def _xframe_middleware():
-    return (
-        "django.middleware.clickjacking.XFrameOptionsMiddleware" in settings.MIDDLEWARE
-    )
+class UpdateError(Exception):
+    """
+    Occurs if Django tries to update a session that was deleted.
+    """
+
+    pass
 
 
-@register(Tags.security, deploy=True)
-def check_security_middleware(app_configs, **kwargs):
-    passed_check = _security_middleware()
-    return [] if passed_check else [W001]
+class SessionBase:
+    """
+    Base class for all Session classes.
+    """
 
+    TEST_COOKIE_NAME = "testcookie"
+    TEST_COOKIE_VALUE = "worked"
 
-@register(Tags.security, deploy=True)
-def check_xframe_options_middleware(app_configs, **kwargs):
-    passed_check = _xframe_middleware()
-    return [] if passed_check else [W002]
+    __not_given = object()
 
+    def __init__(self, session_key=None):
+        self._session_key = session_key
+        self.accessed = False
+        self.modified = False
+        self.serializer = import_string(settings.SESSION_SERIALIZER)
 
-@register(Tags.security, deploy=True)
-def check_sts(app_configs, **kwargs):
-    passed_check = not _security_middleware() or settings.SECURE_HSTS_SECONDS
-    return [] if passed_check else [W004]
+    def __contains__(self, key):
+        return key in self._session
 
+    def __getitem__(self, key):
+        return self._session[key]
 
-@register(Tags.security, deploy=True)
-def check_sts_include_subdomains(app_configs, **kwargs):
-    passed_check = (
-        not _security_middleware()
-        or not settings.SECURE_HSTS_SECONDS
-        or settings.SECURE_HSTS_INCLUDE_SUBDOMAINS is True
-    )
-    return [] if passed_check else [W005]
+    def __setitem__(self, key, value):
+        self._session[key] = value
+        self.modified = True
 
+    async def aset(self, key, value):
+        (await self._aget_session())[key] = value
+        self.modified = True
 
-@register(Tags.security, deploy=True)
-def check_sts_preload(app_configs, **kwargs):
-    passed_check = (
-        not _security_middleware()
-        or not settings.SECURE_HSTS_SECONDS
-        or settings.SECURE_HSTS_PRELOAD is True
-    )
-    return [] if passed_check else [W021]
+    def __delitem__(self, key):
+        del self._session[key]
+        self.modified = True
 
+    @property
+    def key_salt(self):
+        return "django.contrib.sessions." + self.__class__.__qualname__
 
-@register(Tags.security, deploy=True)
-def check_content_type_nosniff(app_configs, **kwargs):
-    passed_check = (
-        not _security_middleware() or settings.SECURE_CONTENT_TYPE_NOSNIFF is True
-    )
-    return [] if passed_check else [W006]
+    def get(self, key, default=None):
+        return self._session.get(key, default)
 
+    async def aget(self, key, default=None):
+        return (await self._aget_session()).get(key, default)
 
-@register(Tags.security, deploy=True)
-def check_ssl_redirect(app_configs, **kwargs):
-    passed_check = not _security_middleware() or settings.SECURE_SSL_REDIRECT is True
-    return [] if passed_check else [W008]
+    def pop(self, key, default=__not_given):
+        self.modified = self.modified or key in self._session
+        args = () if default is self.__not_given else (default,)
+        return self._session.pop(key, *args)
 
+    async def apop(self, key, default=__not_given):
+        self.modified = self.modified or key in (await self._aget_session())
+        args = () if default is self.__not_given else (default,)
+        return (await self._aget_session()).pop(key, *args)
 
-def _check_secret_key(secret_key):
-    return (
-        len(set(secret_key)) >= SECRET_KEY_MIN_UNIQUE_CHARACTERS
-        and len(secret_key) >= SECRET_KEY_MIN_LENGTH
-        and not secret_key.startswith(SECRET_KEY_INSECURE_PREFIX)
-    )
-
-
-@register(Tags.security, deploy=True)
-def check_secret_key(app_configs, **kwargs):
-    try:
-        secret_key = settings.SECRET_KEY
-    except (ImproperlyConfigured, AttributeError):
-        passed_check = False
-    else:
-        passed_check = _check_secret_key(secret_key)
-    return [] if passed_check else [W009]
-
-
-@register(Tags.security, deploy=True)
-def check_secret_key_fallbacks(app_configs, **kwargs):
-    warnings = []
-    try:
-        fallbacks = settings.SECRET_KEY_FALLBACKS
-    except (ImproperlyConfigured, AttributeError):
-        warnings.append(Warning(W025.msg % "SECRET_KEY_FALLBACKS", id=W025.id))
-    else:
-        for index, key in enumerate(fallbacks):
-            if not _check_secret_key(key):
-                warnings.append(
-                    Warning(W025.msg % f"SECRET_KEY_FALLBACKS[{index}]", id=W025.id)
-                )
-    return warnings
-
-
-@register(Tags.security, deploy=True)
-def check_debug(app_configs, **kwargs):
-    passed_check = not settings.DEBUG
-    return [] if passed_check else [W018]
-
-
-@register(Tags.security, deploy=True)
-def check_xframe_deny(app_configs, **kwargs):
-    passed_check = not _xframe_middleware() or settings.X_FRAME_OPTIONS == "DENY"
-    return [] if passed_check else [W019]
-
-
-@register(Tags.security, deploy=True)
-def check_allowed_hosts(app_configs, **kwargs):
-    return [] if settings.ALLOWED_HOSTS else [W020]
-
-
-@register(Tags.security, deploy=True)
-def check_referrer_policy(app_configs, **kwargs):
-    if _security_middleware():
-        if settings.SECURE_REFERRER_POLICY is None:
-            return [W022]
-        # Support a comma-separated string or iterable of values to allow fallback.
-        if isinstance(settings.SECURE_REFERRER_POLICY, str):
-            values = {v.strip() for v in settings.SECURE_REFERRER_POLICY.split(",")}
+    def setdefault(self, key, value):
+        if key in self._session:
+            return self._session[key]
         else:
-            values = set(settings.SECURE_REFERRER_POLICY)
-        if not values <= REFERRER_POLICY_VALUES:
-            return [E023]
-    return []
+            self[key] = value
+            return value
 
+    async def asetdefault(self, key, value):
+        session = await self._aget_session()
+        if key in session:
+            return session[key]
+        else:
+            await self.aset(key, value)
+            return value
 
-@register(Tags.security, deploy=True)
-def check_cross_origin_opener_policy(app_configs, **kwargs):
-    if (
-        _security_middleware()
-        and settings.SECURE_CROSS_ORIGIN_OPENER_POLICY is not None
-        and settings.SECURE_CROSS_ORIGIN_OPENER_POLICY
-        not in CROSS_ORIGIN_OPENER_POLICY_VALUES
-    ):
-        return [E024]
-    return []
+    def set_test_cookie(self):
+        self[self.TEST_COOKIE_NAME] = self.TEST_COOKIE_VALUE
+
+    async def aset_test_cookie(self):
+        await self.aset(self.TEST_COOKIE_NAME, self.TEST_COOKIE_VALUE)
+
+    def test_cookie_worked(self):
+        return self.get(self.TEST_COOKIE_NAME) == self.TEST_COOKIE_VALUE
+
+    async def atest_cookie_worked(self):
+        return (await self.aget(self.TEST_COOKIE_NAME)) == self.TEST_COOKIE_VALUE
+
+    def delete_test_cookie(self):
+        del self[self.TEST_COOKIE_NAME]
+
+    async def adelete_test_cookie(self):
+        del (await self._aget_session())[self.TEST_COOKIE_NAME]
+
+    def encode(self, session_dict):
+        "Return the given session dictionary serialized and encoded as a string."
+        return signing.dumps(
+            session_dict,
+            salt=self.key_salt,
+            serializer=self.serializer,
+            compress=True,
+        )
+
+    def decode(self, session_data):
+        try:
+            return signing.loads(
+                session_data, salt=self.key_salt, serializer=self.serializer
+            )
+        except signing.BadSignature:
+            logger = logging.getLogger("django.security.SuspiciousSession")
+            logger.warning("Session data corrupted")
+        except Exception:
+            # ValueError, unpickling exceptions. If any of these happen, just
+            # return an empty dictionary (an empty session).
+            pass
+        return {}
+
+    def update(self, dict_):
+        self._session.update(dict_)
+        self.modified = True
+
+    async def aupdate(self, dict_):
+        (await self._aget_session()).update(dict_)
+        self.modified = True
+
+    def has_key(self, key):
+        return key in self._session
+
+    async def ahas_key(self, key):
+        return key in (await self._aget_session())
+
+    def keys(self):
+        return self._session.keys()
+
+    async def akeys(self):
+        return (await self._aget_session()).keys()
+
+    def values(self):
+        return self._session.values()
+
+    async def avalues(self):
+        return (await self._aget_session()).values()
+
+    def items(self):
+        return self._session.items()
+
+    async def aitems(self):
+        return (await self._aget_session()).items()
+
+    def clear(self):
+        # To avoid unnecessary persistent storage accesses, we set up the
+        # internals directly (loading data wastes time, since we are going to
+        # set it to an empty dict anyway).
+        self._session_cache = {}
+        self.accessed = True
+        self.modified = True
+
+    def is_empty(self):
+        "Return True when there is no session_key and the session is empty."
+        try:
+            return not self._session_key and not self._session_cache
+        except AttributeError:
+            return True
+
+    def _get_new_session_key(self):
+        "Return session key that isn't being used."
+        while True:
+            session_key = get_random_string(32, VALID_KEY_CHARS)
+            if not self.exists(session_key):
+                return session_key
+
+    async def _aget_new_session_key(self):
+        while True:
+            session_key = get_random_string(32, VALID_KEY_CHARS)
+            if not await self.aexists(session_key):
+                return session_key
+
+    def _get_or_create_session_key(self):
+        if self._session_key is None:
+            self._session_key = self._get_new_session_key()
+        return self._session_key
+
+    async def _aget_or_create_session_key(self):
+        if self._session_key is None:
+            self._session_key = await self._aget_new_session_key()
+        return self._session_key
+
+    def _validate_session_key(self, key):
+        """
+        Key must be truthy and at least 8 characters long. 8 characters is an
+        arbitrary lower bound for some minimal key security.
+        """
+        return key and len(key) >= 8
+
+    def _get_session_key(self):
+        return self.__session_key
+
+    def _set_session_key(self, value):
+        """
+        Validate session key on assignment. Invalid values will set to None.
+        """
+        if self._validate_session_key(value):
+            self.__session_key = value
+        else:
+            self.__session_key = None
+
+    session_key = property(_get_session_key)
+    _session_key = property(_get_session_key, _set_session_key)
+
+    def _get_session(self, no_load=False):
+        """
+        Lazily load session from storage (unless "no_load" is True, when only
+        an empty dict is stored) and store it in the current instance.
+        """
+        self.accessed = True
+        try:
+            return self._session_cache
+        except AttributeError:
+            if self.session_key is None or no_load:
+                self._session_cache = {}
+            else:
+                self._session_cache = self.load()
+        return self._session_cache
+
+    async def _aget_session(self, no_load=False):
+        self.accessed = True
+        try:
+            return self._session_cache
+        except AttributeError:
+            if self.session_key is None or no_load:
+                self._session_cache = {}
+            else:
+                self._session_cache = await self.aload()
+        return self._session_cache
+
+    _session = property(_get_session)
+
+    def get_session_cookie_age(self):
+        return settings.SESSION_COOKIE_AGE
+
+    def get_expiry_age(self, **kwargs):
+        """Get the number of seconds until the session expires.
+
+        Optionally, this function accepts `modification` and `expiry` keyword
+        arguments specifying the modification and expiry of the session.
+        """
+        try:
+            modification = kwargs["modification"]
+        except KeyError:
+            modification = timezone.now()
+        # Make the difference between "expiry=None passed in kwargs" and
+        # "expiry not passed in kwargs", in order to guarantee not to trigger
+        # self.load() when expiry is provided.
+        try:
+            expiry = kwargs["expiry"]
+        except KeyError:
+            expiry = self.get("_session_expiry")
+
+        if not expiry:  # Checks both None and 0 cases
+            return self.get_session_cookie_age()
+        if not isinstance(expiry, (datetime, str)):
+            return expiry
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        delta = expiry - modification
+        return delta.days * 86400 + delta.seconds
+
+    async def aget_expiry_age(self, **kwargs):
+        try:
+            modification = kwargs["modification"]
+        except KeyError:
+            modification = timezone.now()
+        try:
+            expiry = kwargs["expiry"]
+        except KeyError:
+            expiry = await self.aget("_session_expiry")
+
+        if not expiry:  # Checks both None and 0 cases
+            return self.get_session_cookie_age()
+        if not isinstance(expiry, (datetime, str)):
+            return expiry
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        delta = expiry - modification
+        return delta.days * 86400 + delta.seconds
+
+    def get_expiry_date(self, **kwargs):
+        """Get session the expiry date (as a datetime object).
+
+        Optionally, this function accepts `modification` and `expiry` keyword
+        arguments specifying the modification and expiry of the session.
+        """
+        try:
+            modification = kwargs["modification"]
+        except KeyError:
+            modification = timezone.now()
+        # Same comment as in get_expiry_age
+        try:
+            expiry = kwargs["expiry"]
+        except KeyError:
+            expiry = self.get("_session_expiry")
+
+        if isinstance(expiry, datetime):
+            return expiry
+        elif isinstance(expiry, str):
+            return datetime.fromisoformat(expiry)
+        expiry = expiry or self.get_session_cookie_age()
+        return modification + timedelta(seconds=expiry)
+
+    async def aget_expiry_date(self, **kwargs):
+        try:
+            modification = kwargs["modification"]
+        except KeyError:
+            modification = timezone.now()
+        try:
+            expiry = kwargs["expiry"]
+        except KeyError:
+            expiry = await self.aget("_session_expiry")
+
+        if isinstance(expiry, datetime):
+            return expiry
+        elif isinstance(expiry, str):
+            return datetime.fromisoformat(expiry)
+        expiry = expiry or self.get_session_cookie_age()
+        return modification + timedelta(seconds=expiry)
+
+    def set_expiry(self, value):
+        """
+        Set a custom expiration for the session. ``value`` can be an integer,
+        a Python ``datetime`` or ``timedelta`` object or ``None``.
+
+        If ``value`` is an integer, the session will expire after that many
+        seconds of inactivity. If set to ``0`` then the session will expire on
+        browser close.
+
+        If ``value`` is a ``datetime`` or ``timedelta`` object, the session
+        will expire at that specific future time.
+
+        If ``value`` is ``None``, the session uses the global session expiry
+        policy.
+        """
+        if value is None:
+            # Remove any custom expiration for this session.
+            try:
+                del self["_session_expiry"]
+            except KeyError:
+                pass
+            return
+        if isinstance(value, timedelta):
+            value = timezone.now() + value
+        if isinstance(value, datetime):
+            value = value.isoformat()
+        self["_session_expiry"] = value
+
+    async def aset_expiry(self, value):
+        if value is None:
+            # Remove any custom expiration for this session.
+            try:
+                await self.apop("_session_expiry")
+            except KeyError:
+                pass
+            return
+        if isinstance(value, timedelta):
+            value = timezone.now() + value
+        if isinstance(value, datetime):
+            value = value.isoformat()
+        await self.aset("_session_expiry", value)
+
+    def get_expire_at_browser_close(self):
+        """
+        Return ``True`` if the session is set to expire when the browser
+        closes, and ``False`` if there's an expiry date. Use
+        ``get_expiry_date()`` or ``get_expiry_age()`` to find the actual expiry
+        date/age, if there is one.
+        """
+        if (expiry := self.get("_session_expiry")) is None:
+            return settings.SESSION_EXPIRE_AT_BROWSER_CLOSE
+        return expiry == 0
+
+    async def aget_expire_at_browser_close(self):
+        if (expiry := await self.aget("_session_expiry")) is None:
+            return settings.SESSION_EXPIRE_AT_BROWSER_CLOSE
+        return expiry == 0
+
+    def flush(self):
+        """
+        Remove the current session data from the database and regenerate the
+        key.
+        """
+        self.clear()
+        self.delete()
+        self._session_key = None
+
+    async def aflush(self):
+        self.clear()
+        await self.adelete()
+        self._session_key = None
+
+    def cycle_key(self):
+        """
+        Create a new session key, while retaining the current session data.
+        """
+        data = self._session
+        key = self.session_key
+        self.create()
+        self._session_cache = data
+        if key:
+            self.delete(key)
+
+    async def acycle_key(self):
+        """
+        Create a new session key, while retaining the current session data.
+        """
+        data = await self._aget_session()
+        key = self.session_key
+        await self.acreate()
+        self._session_cache = data
+        if key:
+            await self.adelete(key)
+
+    # Methods that child classes must implement.
+
+    def exists(self, session_key):
+        """
+        Return True if the given session_key already exists.
+        """
+        raise NotImplementedError(
+            "subclasses of SessionBase must provide an exists() method"
+        )
+
+    async def aexists(self, session_key):
+        return await sync_to_async(self.exists)(session_key)
+
+    def create(self):
+        """
+        Create a new session instance. Guaranteed to create a new object with
+        a unique key and will have saved the result once (with empty data)
+        before the method returns.
+        """
+        raise NotImplementedError(
+            "subclasses of SessionBase must provide a create() method"
+        )
+
+    async def acreate(self):
+        return await sync_to_async(self.create)()
+
+    def save(self, must_create=False):
+        """
+        Save the session data. If 'must_create' is True, create a new session
+        object (or raise CreateError). Otherwise, only update an existing
+        object and don't create one (raise UpdateError if needed).
+        """
+        raise NotImplementedError(
+            "subclasses of SessionBase must provide a save() method"
+        )
+
+    async def asave(self, must_create=False):
+        return await sync_to_async(self.save)(must_create)
+
+    def delete(self, session_key=None):
+        """
+        Delete the session data under this key. If the key is None, use the
+        current session key value.
+        """
+        raise NotImplementedError(
+            "subclasses of SessionBase must provide a delete() method"
+        )
+
+    async def adelete(self, session_key=None):
+        return await sync_to_async(self.delete)(session_key)
+
+    def load(self):
+        """
+        Load the session data and return a dictionary.
+        """
+        raise NotImplementedError(
+            "subclasses of SessionBase must provide a load() method"
+        )
+
+    async def aload(self):
+        return await sync_to_async(self.load)()
+
+    @classmethod
+    def clear_expired(cls):
+        """
+        Remove expired sessions from the session store.
+
+        If this operation isn't possible on a given backend, it should raise
+        NotImplementedError. If it isn't necessary, because the backend has
+        a built-in expiration mechanism, it should be a no-op.
+        """
+        raise NotImplementedError("This backend does not support clear_expired().")
+
+    @classmethod
+    async def aclear_expired(cls):
+        return await sync_to_async(cls.clear_expired)()

@@ -1,241 +1,145 @@
-"""
-Cache middleware. If enabled, each Django-powered page will be cached based on
-URL. The canonical way to enable cache middleware is to set
-``UpdateCacheMiddleware`` as your first piece of middleware, and
-``FetchFromCacheMiddleware`` as the last::
-
-    MIDDLEWARE = [
-        'django.middleware.cache.UpdateCacheMiddleware',
-        ...
-        'django.middleware.cache.FetchFromCacheMiddleware'
-    ]
-
-This is counterintuitive, but correct: ``UpdateCacheMiddleware`` needs to run
-last during the response phase, which processes middleware bottom-up;
-``FetchFromCacheMiddleware`` needs to run last during the request phase, which
-processes middleware top-down.
-
-The single-class ``CacheMiddleware`` can be used for some simple sites.
-However, if any other piece of middleware needs to affect the cache key, you'll
-need to use the two-part ``UpdateCacheMiddleware`` and
-``FetchFromCacheMiddleware``. This'll most often happen when you're using
-Django's ``LocaleMiddleware``.
-
-More details about how the caching works:
-
-* Only GET or HEAD-requests with status code 200 are cached.
-
-* The number of seconds each page is stored for is set by the "max-age" section
-  of the response's "Cache-Control" header, falling back to the
-  CACHE_MIDDLEWARE_SECONDS setting if the section was not found.
-
-* This middleware expects that a HEAD request is answered with the same response
-  headers exactly like the corresponding GET request.
-
-* When a hit occurs, a shallow copy of the original response object is returned
-  from process_request.
-
-* Pages will be cached based on the contents of the request headers listed in
-  the response's "Vary" header.
-
-* This middleware also sets ETag, Last-Modified, Expires and Cache-Control
-  headers on the response object.
-
-* If the request had an Authorization header and the response was not marked
-  "Cache-Control: public", the response will vary on Authorization.
-"""
-
-import time
-
 from django.conf import settings
-from django.core.cache import DEFAULT_CACHE_ALIAS, caches
-from django.utils.cache import (
-    get_cache_key,
-    get_max_age,
-    has_vary_header,
-    learn_cache_key,
-    patch_response_headers,
-    patch_vary_headers,
-)
-from django.utils.deprecation import MiddlewareMixin
-from django.utils.http import parse_http_date_safe
+from django.contrib.sessions.backends.base import CreateError, SessionBase, UpdateError
+from django.core.cache import caches
+
+KEY_PREFIX = "django.contrib.sessions.cache"
 
 
-class UpdateCacheMiddleware(MiddlewareMixin):
+class SessionStore(SessionBase):
     """
-    Response-phase cache middleware that updates the cache if the response is
-    cacheable.
-
-    Must be used as part of the two-part update/fetch cache middleware.
-    UpdateCacheMiddleware must be the first piece of middleware in MIDDLEWARE
-    so that it'll get called last during the response phase.
+    A cache-based session store.
     """
 
-    def __init__(self, get_response):
-        super().__init__(get_response)
-        self.cache_timeout = settings.CACHE_MIDDLEWARE_SECONDS
-        self.page_timeout = None
-        self.key_prefix = settings.CACHE_MIDDLEWARE_KEY_PREFIX
-        self.cache_alias = settings.CACHE_MIDDLEWARE_ALIAS
+    cache_key_prefix = KEY_PREFIX
+
+    def __init__(self, session_key=None):
+        self._cache = caches[settings.SESSION_CACHE_ALIAS]
+        super().__init__(session_key)
 
     @property
-    def cache(self):
-        return caches[self.cache_alias]
+    def cache_key(self):
+        return self.cache_key_prefix + self._get_or_create_session_key()
 
-    def _should_update_cache(self, request, response):
-        return hasattr(request, "_cache_update_cache") and request._cache_update_cache
+    async def acache_key(self):
+        return self.cache_key_prefix + await self._aget_or_create_session_key()
 
-    def process_response(self, request, response):
-        """Set the cache, if needed."""
-        if not self._should_update_cache(request, response):
-            # We don't need to update the cache, just return.
-            return response
-
-        if response.streaming or response.status_code not in (200, 304):
-            return response
-
-        # Don't cache responses that set a user-specific (and maybe security
-        # sensitive) cookie while varying on Cookie.
-        if response.cookies and has_vary_header(response, "Cookie"):
-            return response
-
-        # Don't cache responses when the Cache-Control header is set to
-        # private, no-cache, or no-store.
-        cache_control = response.get("Cache-Control", "").lower()
-        if cache_control and any(
-            directive in cache_control
-            for directive in (
-                "private",
-                "no-cache",
-                "no-store",
-            )
-        ):
-            return response
-
-        # Don't cache responses when the Vary header contains '*'.
-        if has_vary_header(response, "*"):
-            return response
-
-        # Page timeout takes precedence over the "max-age" and the default
-        # cache timeout.
-        timeout = self.page_timeout
-        if timeout is None:
-            # The timeout from the "max-age" section of the "Cache-Control"
-            # header takes precedence over the default cache timeout.
-            timeout = get_max_age(response)
-            if timeout is None:
-                timeout = self.cache_timeout
-            elif timeout == 0:
-                # max-age was set to 0, don't cache.
-                return response
-        patch_response_headers(response, timeout)
-        # Make the response vary on Authorization if the request bears that
-        # header, unless allowed by "public" per RFC 9111, Section 3.5. No
-        # exceptions are made for "s-maxage" and "must-revalidate" since these
-        # are not currently implemented by Django.
-        if request.headers.get("Authorization") and "public" not in cache_control:
-            patch_vary_headers(response, ("Authorization",))
-        if timeout and response.status_code == 200:
-            cache_key = learn_cache_key(
-                request, response, timeout, self.key_prefix, cache=self.cache
-            )
-            if hasattr(response, "render") and callable(response.render):
-                response.add_post_render_callback(
-                    lambda r: self.cache.set(cache_key, r, timeout)
-                )
-            else:
-                self.cache.set(cache_key, response, timeout)
-        return response
-
-
-class FetchFromCacheMiddleware(MiddlewareMixin):
-    """
-    Request-phase cache middleware that fetches a page from the cache.
-
-    Must be used as part of the two-part update/fetch cache middleware.
-    FetchFromCacheMiddleware must be the last piece of middleware in MIDDLEWARE
-    so that it'll get called last during the request phase.
-    """
-
-    def __init__(self, get_response):
-        super().__init__(get_response)
-        self.key_prefix = settings.CACHE_MIDDLEWARE_KEY_PREFIX
-        self.cache_alias = settings.CACHE_MIDDLEWARE_ALIAS
-
-    @property
-    def cache(self):
-        return caches[self.cache_alias]
-
-    def process_request(self, request):
-        """
-        Check whether the page is already cached and return the cached
-        version if available.
-        """
-        if request.method not in ("GET", "HEAD"):
-            request._cache_update_cache = False
-            return None  # Don't bother checking the cache.
-
-        # try and get the cached GET response
-        cache_key = get_cache_key(request, self.key_prefix, "GET", cache=self.cache)
-        if cache_key is None:
-            request._cache_update_cache = True
-            return None  # No cache information available, need to rebuild.
-        response = self.cache.get(cache_key)
-        # if it wasn't found and we are looking for a HEAD, try looking just for that
-        if response is None and request.method == "HEAD":
-            cache_key = get_cache_key(
-                request, self.key_prefix, "HEAD", cache=self.cache
-            )
-            response = self.cache.get(cache_key)
-
-        if response is None:
-            request._cache_update_cache = True
-            return None  # No cache information available, need to rebuild.
-
-        # Derive the age estimation of the cached response.
-        if (max_age_seconds := get_max_age(response)) is not None and (
-            expires_timestamp := parse_http_date_safe(response["Expires"])
-        ) is not None:
-            now_timestamp = int(time.time())
-            remaining_seconds = expires_timestamp - now_timestamp
-            # Use Age: 0 if local clock got turned back.
-            response["Age"] = max(0, max_age_seconds - remaining_seconds)
-
-        # hit, return cached response
-        request._cache_update_cache = False
-        return response
-
-
-class CacheMiddleware(UpdateCacheMiddleware, FetchFromCacheMiddleware):
-    """
-    Cache middleware that provides basic behavior for many simple sites.
-
-    Also used as the hook point for the cache decorator, which is generated
-    using the decorator-from-middleware utility.
-    """
-
-    def __init__(self, get_response, cache_timeout=None, page_timeout=None, **kwargs):
-        super().__init__(get_response)
-        # We need to differentiate between "provided, but using default value",
-        # and "not provided". If the value is provided using a default, then
-        # we fall back to system defaults. If it is not provided at all,
-        # we need to use middleware defaults.
-
+    def load(self):
         try:
-            key_prefix = kwargs["key_prefix"]
-            if key_prefix is None:
-                key_prefix = ""
-            self.key_prefix = key_prefix
-        except KeyError:
-            pass
-        try:
-            cache_alias = kwargs["cache_alias"]
-            if cache_alias is None:
-                cache_alias = DEFAULT_CACHE_ALIAS
-            self.cache_alias = cache_alias
-        except KeyError:
-            pass
+            session_data = self._cache.get(self.cache_key)
+        except Exception:
+            # Some backends (e.g. memcache) raise an exception on invalid
+            # cache keys. If this happens, reset the session. See #17810.
+            session_data = None
+        if session_data is not None:
+            return session_data
+        self._session_key = None
+        return {}
 
-        if cache_timeout is not None:
-            self.cache_timeout = cache_timeout
-        self.page_timeout = page_timeout
+    async def aload(self):
+        try:
+            session_data = await self._cache.aget(await self.acache_key())
+        except Exception:
+            session_data = None
+        if session_data is not None:
+            return session_data
+        self._session_key = None
+        return {}
+
+    def create(self):
+        # Because a cache can fail silently (e.g. memcache), we don't know if
+        # we are failing to create a new session because of a key collision or
+        # because the cache is missing. So we try for a (large) number of times
+        # and then raise an exception. That's the risk you shoulder if using
+        # cache backing.
+        for i in range(10000):
+            self._session_key = self._get_new_session_key()
+            try:
+                self.save(must_create=True)
+            except CreateError:
+                continue
+            self.modified = True
+            return
+        raise RuntimeError(
+            "Unable to create a new session key. "
+            "It is likely that the cache is unavailable."
+        )
+
+    async def acreate(self):
+        for i in range(10000):
+            self._session_key = await self._aget_new_session_key()
+            try:
+                await self.asave(must_create=True)
+            except CreateError:
+                continue
+            self.modified = True
+            return
+        raise RuntimeError(
+            "Unable to create a new session key. "
+            "It is likely that the cache is unavailable."
+        )
+
+    def save(self, must_create=False):
+        if self.session_key is None:
+            return self.create()
+        if must_create:
+            func = self._cache.add
+        elif self._cache.get(self.cache_key) is not None:
+            func = self._cache.set
+        else:
+            raise UpdateError
+        result = func(
+            self.cache_key,
+            self._get_session(no_load=must_create),
+            self.get_expiry_age(),
+        )
+        if must_create and not result:
+            raise CreateError
+
+    async def asave(self, must_create=False):
+        if self.session_key is None:
+            return await self.acreate()
+        if must_create:
+            func = self._cache.aadd
+        elif await self._cache.aget(await self.acache_key()) is not None:
+            func = self._cache.aset
+        else:
+            raise UpdateError
+        result = await func(
+            await self.acache_key(),
+            await self._aget_session(no_load=must_create),
+            await self.aget_expiry_age(),
+        )
+        if must_create and not result:
+            raise CreateError
+
+    def exists(self, session_key):
+        return (
+            bool(session_key) and (self.cache_key_prefix + session_key) in self._cache
+        )
+
+    async def aexists(self, session_key):
+        return bool(session_key) and await self._cache.ahas_key(
+            self.cache_key_prefix + session_key
+        )
+
+    def delete(self, session_key=None):
+        if session_key is None:
+            if self.session_key is None:
+                return
+            session_key = self.session_key
+        self._cache.delete(self.cache_key_prefix + session_key)
+
+    async def adelete(self, session_key=None):
+        if session_key is None:
+            if self.session_key is None:
+                return
+            session_key = self.session_key
+        await self._cache.adelete(self.cache_key_prefix + session_key)
+
+    @classmethod
+    def clear_expired(cls):
+        pass
+
+    @classmethod
+    async def aclear_expired(cls):
+        pass

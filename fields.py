@@ -1,365 +1,156 @@
-from django.db.migrations.utils import field_references
-from django.db.models import NOT_PROVIDED
-from django.utils.functional import cached_property
+from django import forms
+from django.contrib.gis.gdal import GDALException
+from django.contrib.gis.geos import GEOSException, GEOSGeometry
+from django.contrib.gis.geos.prototypes.io import MAX_GEOM_COLLECTIONS
+from django.core.exceptions import ValidationError
+from django.utils.translation import gettext_lazy as _
 
-from .base import Operation, OperationCategory
+from .widgets import OpenLayersWidget
 
 
-class FieldOperation(Operation):
-    def __init__(self, model_name, name, field=None):
-        self.model_name = model_name
-        self.name = name
-        self.field = field
+class GeometryField(forms.Field):
+    """
+    This is the basic form field for a Geometry.  Any textual input that is
+    accepted by GEOSGeometry is accepted by this form.  By default,
+    this includes WKT, HEXEWKB, WKB (in a buffer), and GeoJSON.
+    """
 
-    @cached_property
-    def model_name_lower(self):
-        return self.model_name.lower()
+    widget = OpenLayersWidget
+    geom_type = "GEOMETRY"
+    max_geom_collections = MAX_GEOM_COLLECTIONS
 
-    @cached_property
-    def name_lower(self):
-        return self.name.lower()
+    default_error_messages = {
+        "required": _("No geometry value provided."),
+        "invalid_geom": _("Invalid geometry value."),
+        "invalid_geom_type": _("Invalid geometry type."),
+        "transform_error": _(
+            "An error occurred when transforming the geometry "
+            "to the SRID of the geometry form field."
+        ),
+    }
 
-    def is_same_model_operation(self, operation):
-        return self.model_name_lower == operation.model_name_lower
+    def __init__(
+        self, *, srid=None, geom_type=None, max_geom_collections=None, **kwargs
+    ):
+        self.srid = srid
+        if geom_type is not None:
+            self.geom_type = geom_type
+        if max_geom_collections is not None:
+            self.max_geom_collections = max_geom_collections
+        super().__init__(**kwargs)
+        self.widget.attrs["geom_type"] = self.geom_type
+        # Propagate the limit to the (per-field) widget instance, which does
+        # the actual parsing. Custom widgets that override deserialize() and
+        # ignore this attribute still get the default limit via GEOSGeometry.
+        self.widget.max_geom_collections = self.max_geom_collections
 
-    def is_same_field_operation(self, operation):
-        return (
-            self.is_same_model_operation(operation)
-            and self.name_lower == operation.name_lower
-        )
+    def to_python(self, value):
+        """Transform the value to a Geometry object."""
+        if value in self.empty_values:
+            return None
 
-    def references_model(self, name, app_label):
-        name_lower = name.lower()
-        if name_lower == self.model_name_lower:
-            return True
-        if self.field:
-            return bool(
-                field_references(
-                    (app_label, self.model_name_lower),
-                    self.field,
-                    (app_label, name_lower),
+        if not isinstance(value, GEOSGeometry):
+            if hasattr(self.widget, "deserialize"):
+                try:
+                    value = self.widget.deserialize(value)
+                except GDALException:
+                    value = None
+            else:
+                try:
+                    value = GEOSGeometry(
+                        value, max_geom_collections=self.max_geom_collections
+                    )
+                except (GEOSException, ValueError, TypeError):
+                    value = None
+            if value is None:
+                raise ValidationError(
+                    self.error_messages["invalid_geom"], code="invalid_geom"
                 )
-            )
-        return False
 
-    def references_field(self, model_name, name, app_label):
-        model_name_lower = model_name.lower()
-        # Check if this operation locally references the field.
-        if model_name_lower == self.model_name_lower:
-            if name == self.name:
-                return True
-            elif (
-                self.field
-                and hasattr(self.field, "from_fields")
-                and name in self.field.from_fields
-            ):
-                return True
-        # Check if this operation remotely references the field.
-        if self.field is None:
-            return False
-        return bool(
-            field_references(
-                (app_label, self.model_name_lower),
-                self.field,
-                (app_label, model_name_lower),
-                name,
-            )
-        )
+        # Try to set the srid
+        if not value.srid:
+            try:
+                value.srid = self.widget.map_srid
+            except AttributeError:
+                if self.srid:
+                    value.srid = self.srid
+        return value
 
-    def reduce(self, operation, app_label):
-        return super().reduce(operation, app_label) or not operation.references_field(
-            self.model_name, self.name, app_label
-        )
+    def clean(self, value):
+        """
+        Validate that the input value can be converted to a Geometry object
+        and return it. Raise a ValidationError if the value cannot be
+        instantiated as a Geometry.
+        """
+        geom = super().clean(value)
+        if geom is None:
+            return geom
 
-
-class AddField(FieldOperation):
-    """Add a field to a model."""
-
-    category = OperationCategory.ADDITION
-
-    def __init__(self, model_name, name, field, preserve_default=True):
-        self.preserve_default = preserve_default
-        super().__init__(model_name, name, field)
-
-    def deconstruct(self):
-        kwargs = {
-            "model_name": self.model_name,
-            "name": self.name,
-            "field": self.field,
-        }
-        if self.preserve_default is not True:
-            kwargs["preserve_default"] = self.preserve_default
-        return (self.__class__.__name__, [], kwargs)
-
-    def state_forwards(self, app_label, state):
-        state.add_field(
-            app_label,
-            self.model_name_lower,
-            self.name,
-            self.field,
-            self.preserve_default,
-        )
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        to_model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
-            from_model = from_state.apps.get_model(app_label, self.model_name)
-            field = to_model._meta.get_field(self.name)
-            if not self.preserve_default:
-                field.default = self.field.default
-            schema_editor.add_field(
-                from_model,
-                field,
-            )
-            if not self.preserve_default:
-                field.default = NOT_PROVIDED
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        from_model = from_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, from_model):
-            schema_editor.remove_field(
-                from_model, from_model._meta.get_field(self.name)
-            )
-
-    def describe(self):
-        return "Add field %s to %s" % (self.name, self.model_name)
-
-    @property
-    def migration_name_fragment(self):
-        return "%s_%s" % (self.model_name_lower, self.name_lower)
-
-    def reduce(self, operation, app_label):
-        if isinstance(operation, FieldOperation) and self.is_same_field_operation(
-            operation
-        ):
-            if isinstance(operation, AlterField):
-                return [
-                    AddField(
-                        model_name=self.model_name,
-                        name=operation.name,
-                        field=operation.field,
-                    ),
-                ]
-            elif isinstance(operation, RemoveField):
-                return []
-            elif isinstance(operation, RenameField):
-                return [
-                    AddField(
-                        model_name=self.model_name,
-                        name=operation.new_name,
-                        field=self.field,
-                    ),
-                ]
-        return super().reduce(operation, app_label)
-
-
-class RemoveField(FieldOperation):
-    """Remove a field from a model."""
-
-    category = OperationCategory.REMOVAL
-
-    def deconstruct(self):
-        kwargs = {
-            "model_name": self.model_name,
-            "name": self.name,
-        }
-        return (self.__class__.__name__, [], kwargs)
-
-    def state_forwards(self, app_label, state):
-        state.remove_field(app_label, self.model_name_lower, self.name)
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        from_model = from_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, from_model):
-            schema_editor.remove_field(
-                from_model, from_model._meta.get_field(self.name)
-            )
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        to_model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
-            from_model = from_state.apps.get_model(app_label, self.model_name)
-            schema_editor.add_field(from_model, to_model._meta.get_field(self.name))
-
-    def describe(self):
-        return "Remove field %s from %s" % (self.name, self.model_name)
-
-    @property
-    def migration_name_fragment(self):
-        return "remove_%s_%s" % (self.model_name_lower, self.name_lower)
-
-    def reduce(self, operation, app_label):
-        from .models import DeleteModel
-
+        # Ensuring that the geometry is of the correct type (indicated
+        # using the OGC string label).
         if (
-            isinstance(operation, DeleteModel)
-            and operation.name_lower == self.model_name_lower
+            str(geom.geom_type).upper() != self.geom_type
+            and self.geom_type != "GEOMETRY"
         ):
-            return [operation]
-        return super().reduce(operation, app_label)
-
-
-class AlterField(FieldOperation):
-    """
-    Alter a field's database column (e.g. null, max_length) to the provided
-    new field.
-    """
-
-    category = OperationCategory.ALTERATION
-
-    def __init__(self, model_name, name, field, preserve_default=True):
-        self.preserve_default = preserve_default
-        super().__init__(model_name, name, field)
-
-    def deconstruct(self):
-        kwargs = {
-            "model_name": self.model_name,
-            "name": self.name,
-            "field": self.field,
-        }
-        if self.preserve_default is not True:
-            kwargs["preserve_default"] = self.preserve_default
-        return (self.__class__.__name__, [], kwargs)
-
-    def state_forwards(self, app_label, state):
-        state.alter_field(
-            app_label,
-            self.model_name_lower,
-            self.name,
-            self.field,
-            self.preserve_default,
-        )
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        to_model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
-            from_model = from_state.apps.get_model(app_label, self.model_name)
-            from_field = from_model._meta.get_field(self.name)
-            to_field = to_model._meta.get_field(self.name)
-            if not self.preserve_default:
-                to_field.default = self.field.default
-            schema_editor.alter_field(from_model, from_field, to_field)
-            if not self.preserve_default:
-                to_field.default = NOT_PROVIDED
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        self.database_forwards(app_label, schema_editor, from_state, to_state)
-
-    def describe(self):
-        return "Alter field %s on %s" % (self.name, self.model_name)
-
-    @property
-    def migration_name_fragment(self):
-        return "alter_%s_%s" % (self.model_name_lower, self.name_lower)
-
-    def reduce(self, operation, app_label):
-        if isinstance(
-            operation, (AlterField, RemoveField)
-        ) and self.is_same_field_operation(operation):
-            return [operation]
-        elif (
-            isinstance(operation, RenameField)
-            and self.is_same_field_operation(operation)
-            and self.field.db_column is None
-        ):
-            return [
-                operation,
-                AlterField(
-                    model_name=self.model_name,
-                    name=operation.new_name,
-                    field=self.field,
-                ),
-            ]
-        return super().reduce(operation, app_label)
-
-
-class RenameField(FieldOperation):
-    """Rename a field on the model. Might affect db_column too."""
-
-    category = OperationCategory.ALTERATION
-
-    def __init__(self, model_name, old_name, new_name):
-        self.old_name = old_name
-        self.new_name = new_name
-        super().__init__(model_name, old_name)
-
-    @cached_property
-    def old_name_lower(self):
-        return self.old_name.lower()
-
-    @cached_property
-    def new_name_lower(self):
-        return self.new_name.lower()
-
-    def deconstruct(self):
-        kwargs = {
-            "model_name": self.model_name,
-            "old_name": self.old_name,
-            "new_name": self.new_name,
-        }
-        return (self.__class__.__name__, [], kwargs)
-
-    def state_forwards(self, app_label, state):
-        state.rename_field(
-            app_label, self.model_name_lower, self.old_name, self.new_name
-        )
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        to_model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
-            from_model = from_state.apps.get_model(app_label, self.model_name)
-            schema_editor.alter_field(
-                from_model,
-                from_model._meta.get_field(self.old_name),
-                to_model._meta.get_field(self.new_name),
+            raise ValidationError(
+                self.error_messages["invalid_geom_type"], code="invalid_geom_type"
             )
 
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        to_model = to_state.apps.get_model(app_label, self.model_name)
-        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
-            from_model = from_state.apps.get_model(app_label, self.model_name)
-            schema_editor.alter_field(
-                from_model,
-                from_model._meta.get_field(self.new_name),
-                to_model._meta.get_field(self.old_name),
-            )
+        # Transforming the geometry if the SRID was set.
+        if self.srid and self.srid != -1 and self.srid != geom.srid:
+            try:
+                geom.transform(self.srid)
+            except GEOSException:
+                raise ValidationError(
+                    self.error_messages["transform_error"], code="transform_error"
+                )
 
-    def describe(self):
-        return "Rename field %s on %s to %s" % (
-            self.old_name,
-            self.model_name,
-            self.new_name,
-        )
+        return geom
 
-    @property
-    def migration_name_fragment(self):
-        return "rename_%s_%s_%s" % (
-            self.old_name_lower,
-            self.model_name_lower,
-            self.new_name_lower,
-        )
+    def has_changed(self, initial, data):
+        """Compare geographic value of data with its initial value."""
 
-    def references_field(self, model_name, name, app_label):
-        return self.references_model(model_name, app_label) and (
-            name.lower() == self.old_name_lower or name.lower() == self.new_name_lower
-        )
+        try:
+            data = self.to_python(data)
+            initial = self.to_python(initial)
+        except ValidationError:
+            return True
 
-    def reduce(self, operation, app_label):
-        if (
-            isinstance(operation, RenameField)
-            and self.is_same_model_operation(operation)
-            and self.new_name_lower == operation.old_name_lower
-        ):
-            return [
-                RenameField(
-                    self.model_name,
-                    self.old_name,
-                    operation.new_name,
-                ),
-            ]
-        # Skip `FieldOperation.reduce` as we want to run `references_field`
-        # against self.old_name and self.new_name.
-        return super(FieldOperation, self).reduce(operation, app_label) or not (
-            operation.references_field(self.model_name, self.old_name, app_label)
-            or operation.references_field(self.model_name, self.new_name, app_label)
-        )
+        # Only do a geographic comparison if both values are available
+        if initial and data:
+            data.transform(initial.srid)
+            # If the initial value was not added by the browser, the geometry
+            # provided may be slightly different, the first time it is saved.
+            # The comparison is done with a very low tolerance.
+            return not initial.equals_exact(data, tolerance=0.000001)
+        else:
+            # Check for change of state of existence
+            return bool(initial) != bool(data)
+
+
+class GeometryCollectionField(GeometryField):
+    geom_type = "GEOMETRYCOLLECTION"
+
+
+class PointField(GeometryField):
+    geom_type = "POINT"
+
+
+class MultiPointField(GeometryField):
+    geom_type = "MULTIPOINT"
+
+
+class LineStringField(GeometryField):
+    geom_type = "LINESTRING"
+
+
+class MultiLineStringField(GeometryField):
+    geom_type = "MULTILINESTRING"
+
+
+class PolygonField(GeometryField):
+    geom_type = "POLYGON"
+
+
+class MultiPolygonField(GeometryField):
+    geom_type = "MULTIPOLYGON"

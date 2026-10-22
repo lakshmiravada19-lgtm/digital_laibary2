@@ -1,112 +1,59 @@
 import json
 
-from django.contrib.postgres import forms, lookups
-from django.contrib.postgres.fields.array import ArrayField
-from django.core import exceptions
-from django.db.models import Field, TextField, Transform
-from django.db.models.fields.mixins import CheckFieldDefaultMixin
+from django import forms
+from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 
 __all__ = ["HStoreField"]
 
 
-class HStoreField(CheckFieldDefaultMixin, Field):
-    empty_strings_allowed = False
-    description = _("Map of strings to strings/nulls")
+class HStoreField(forms.CharField):
+    """
+    A field for HStore data which accepts dictionary JSON input.
+    """
+
+    widget = forms.Textarea
     default_error_messages = {
-        "not_a_string": _("The value of “%(key)s” is not a string or null."),
+        "invalid_json": _("Could not load JSON data."),
+        "invalid_format": _("Input must be a JSON dictionary."),
     }
-    _default_hint = ("dict", "{}")
 
-    def db_type(self, connection):
-        return "hstore"
-
-    def get_transform(self, name):
-        transform = super().get_transform(name)
-        if transform:
-            return transform
-        return KeyTransformFactory(name)
-
-    def validate(self, value, model_instance):
-        super().validate(value, model_instance)
-        for key, val in value.items():
-            if not isinstance(val, str) and val is not None:
-                raise exceptions.ValidationError(
-                    self.error_messages["not_a_string"],
-                    code="not_a_string",
-                    params={"key": key},
-                )
+    def prepare_value(self, value):
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return value
 
     def to_python(self, value):
-        if isinstance(value, str):
-            value = json.loads(value)
+        if not value:
+            return {}
+        if not isinstance(value, dict):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                raise ValidationError(
+                    self.error_messages["invalid_json"],
+                    code="invalid_json",
+                )
+
+        if not isinstance(value, dict):
+            raise ValidationError(
+                self.error_messages["invalid_format"],
+                code="invalid_format",
+            )
+
+        # Cast everything to strings for ease.
+        for key, val in value.items():
+            if val is not None:
+                val = str(val)
+            value[key] = val
         return value
 
-    def value_to_string(self, obj):
-        return json.dumps(self.value_from_object(obj), ensure_ascii=False)
-
-    def formfield(self, **kwargs):
-        return super().formfield(
-            **{
-                "form_class": forms.HStoreField,
-                **kwargs,
-            }
-        )
-
-    def get_prep_value(self, value):
-        value = super().get_prep_value(value)
-
-        if isinstance(value, dict):
-            prep_value = {}
-            for key, val in value.items():
-                key = str(key)
-                if val is not None:
-                    val = str(val)
-                prep_value[key] = val
-            value = prep_value
-
-        if isinstance(value, list):
-            value = [str(item) for item in value]
-
-        return value
-
-
-HStoreField.register_lookup(lookups.DataContains)
-HStoreField.register_lookup(lookups.ContainedBy)
-HStoreField.register_lookup(lookups.HasKey)
-HStoreField.register_lookup(lookups.HasKeys)
-HStoreField.register_lookup(lookups.HasAnyKeys)
-
-
-class KeyTransform(Transform):
-    output_field = TextField()
-
-    def __init__(self, key_name, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.key_name = key_name
-
-    def as_sql(self, compiler, connection):
-        lhs, params = compiler.compile(self.lhs)
-        return "(%s -> %%s)" % lhs, tuple(params) + (self.key_name,)
-
-
-class KeyTransformFactory:
-    def __init__(self, key_name):
-        self.key_name = key_name
-
-    def __call__(self, *args, **kwargs):
-        return KeyTransform(self.key_name, *args, **kwargs)
-
-
-@HStoreField.register_lookup
-class KeysTransform(Transform):
-    lookup_name = "keys"
-    function = "akeys"
-    output_field = ArrayField(TextField())
-
-
-@HStoreField.register_lookup
-class ValuesTransform(Transform):
-    lookup_name = "values"
-    function = "avals"
-    output_field = ArrayField(TextField())
+    def has_changed(self, initial, data):
+        """
+        Return True if data differs from initial.
+        """
+        # For purposes of seeing whether something has changed, None is
+        # the same as an empty dict, if the data or initial value we get
+        # is None, replace it w/ {}.
+        initial_value = self.to_python(initial)
+        return super().has_changed(initial_value, data)

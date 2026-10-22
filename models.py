@@ -1,71 +1,49 @@
-"""
-The GeometryColumns and SpatialRefSys models for the SpatiaLite backend.
-"""
-
-from django.contrib.gis.db.backends.base.models import SpatialRefSysMixin
+from django.contrib.sites.models import Site
 from django.db import models
+from django.urls import NoReverseMatch, get_script_prefix, reverse
+from django.utils.encoding import iri_to_uri
+from django.utils.translation import gettext_lazy as _
 
 
-class SpatialiteGeometryColumns(models.Model):
-    """
-    The 'geometry_columns' table from SpatiaLite.
-    """
-
-    f_table_name = models.CharField(max_length=256)
-    f_geometry_column = models.CharField(max_length=256)
-    coord_dimension = models.IntegerField()
-    srid = models.IntegerField(primary_key=True)
-    spatial_index_enabled = models.IntegerField()
-    type = models.IntegerField(db_column="geometry_type")
+class FlatPage(models.Model):
+    url = models.CharField(_("URL"), max_length=100, db_index=True)
+    title = models.CharField(_("title"), max_length=200)
+    content = models.TextField(_("content"), blank=True)
+    enable_comments = models.BooleanField(_("enable comments"), default=False)
+    template_name = models.CharField(
+        _("template name"),
+        max_length=70,
+        blank=True,
+        help_text=_(
+            "Example: “flatpages/contact_page.html”. If this isn’t provided, "
+            "the system will use “flatpages/default.html”."
+        ),
+    )
+    registration_required = models.BooleanField(
+        _("registration required"),
+        help_text=_(
+            "If this is checked, only logged-in users will be able to view the page."
+        ),
+        default=False,
+    )
+    sites = models.ManyToManyField(Site, verbose_name=_("sites"))
 
     class Meta:
-        app_label = "gis"
-        db_table = "geometry_columns"
-        managed = False
+        db_table = "django_flatpage"
+        verbose_name = _("flat page")
+        verbose_name_plural = _("flat pages")
+        ordering = ["url"]
 
     def __str__(self):
-        return "%s.%s - %dD %s field (SRID: %d)" % (
-            self.f_table_name,
-            self.f_geometry_column,
-            self.coord_dimension,
-            self.type,
-            self.srid,
-        )
+        return "%s -- %s" % (self.url, self.title)
 
-    @classmethod
-    def table_name_col(cls):
-        """
-        Return the name of the metadata column used to store the feature table
-        name.
-        """
-        return "f_table_name"
+    def get_absolute_url(self):
+        from .views import flatpage
 
-    @classmethod
-    def geom_col_name(cls):
-        """
-        Return the name of the metadata column used to store the feature
-        geometry column.
-        """
-        return "f_geometry_column"
-
-
-class SpatialiteSpatialRefSys(models.Model, SpatialRefSysMixin):
-    """
-    The 'spatial_ref_sys' table from SpatiaLite.
-    """
-
-    srid = models.IntegerField(primary_key=True)
-    auth_name = models.CharField(max_length=256)
-    auth_srid = models.IntegerField()
-    ref_sys_name = models.CharField(max_length=256)
-    proj4text = models.CharField(max_length=2048)
-    srtext = models.CharField(max_length=2048)
-
-    class Meta:
-        app_label = "gis"
-        db_table = "spatial_ref_sys"
-        managed = False
-
-    @property
-    def wkt(self):
-        return self.srtext
+        for url in (self.url.lstrip("/"), self.url):
+            try:
+                return reverse(flatpage, kwargs={"url": url})
+            except NoReverseMatch:
+                pass
+        # Handle script prefix manually because we bypass reverse()
+        return iri_to_uri(get_script_prefix().rstrip("/") + self.url)

@@ -1,19 +1,6 @@
-from django.conf import settings
-from django.conf.urls.static import static
-from django.contrib.staticfiles.views import serve
+from django.contrib.flatpages import views
+from django.urls import path
 
-urlpatterns = []
-
-
-def staticfiles_urlpatterns(prefix=None):
-    """
-    Helper function to return a URL pattern for serving static files.
-    """
-    if prefix is None:
-        prefix = settings.STATIC_URL
-    return static(prefix, view=serve)
-
-
-# Only append if urlpatterns are empty
-if settings.DEBUG and not urlpatterns:
-    urlpatterns += staticfiles_urlpatterns()
+urlpatterns = [
+    path("<path:url>", views.flatpage, name="django.contrib.flatpages.views.flatpage"),
+]

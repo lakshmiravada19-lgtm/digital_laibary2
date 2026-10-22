@@ -1,29 +1,46 @@
-from django.conf import STATICFILES_STORAGE_ALIAS, settings
-from django.contrib.staticfiles.finders import get_finders
+from itertools import chain
+
+from django.apps import apps
 from django.core.checks import Error
 
-E005 = Error(
-    f"The STORAGES setting must define a '{STATICFILES_STORAGE_ALIAS}' storage.",
-    id="staticfiles.E005",
-)
 
+def check_generic_foreign_keys(app_configs=None, **kwargs):
+    from .fields import GenericForeignKey
 
-def check_finders(app_configs=None, **kwargs):
-    """Check all registered staticfiles finders."""
+    if app_configs is None:
+        models = apps.get_models()
+    else:
+        models = chain.from_iterable(
+            app_config.get_models() for app_config in app_configs
+        )
     errors = []
-    for finder in get_finders():
-        try:
-            finder_errors = finder.check()
-        except NotImplementedError:
-            pass
-        else:
-            errors.extend(finder_errors)
+    fields = (
+        obj
+        for model in models
+        for obj in vars(model).values()
+        if isinstance(obj, GenericForeignKey)
+    )
+    for field in fields:
+        errors.extend(field.check())
     return errors
 
 
-def check_storages(app_configs=None, **kwargs):
-    """Ensure staticfiles is defined in STORAGES setting."""
+def check_model_name_lengths(app_configs=None, **kwargs):
+    if app_configs is None:
+        models = apps.get_models()
+    else:
+        models = chain.from_iterable(
+            app_config.get_models() for app_config in app_configs
+        )
     errors = []
-    if STATICFILES_STORAGE_ALIAS not in settings.STORAGES:
-        errors.append(E005)
+    for model in models:
+        if len(model._meta.model_name) > 100:
+            errors.append(
+                Error(
+                    "Model names must be at most 100 characters (got %d)."
+                    % (len(model._meta.model_name),),
+                    obj=model,
+                    id="contenttypes.E005",
+                )
+            )
     return errors

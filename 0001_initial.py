@@ -1,4 +1,4 @@
-import django.contrib.sessions.models
+import django.contrib.contenttypes.models
 from django.db import migrations, models
 
 
@@ -7,31 +7,39 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.CreateModel(
-            name="Session",
+            name="ContentType",
             fields=[
                 (
-                    "session_key",
-                    models.CharField(
-                        max_length=40,
+                    "id",
+                    models.AutoField(
+                        verbose_name="ID",
                         serialize=False,
-                        verbose_name="session key",
+                        auto_created=True,
                         primary_key=True,
                     ),
                 ),
-                ("session_data", models.TextField(verbose_name="session data")),
+                ("name", models.CharField(max_length=100)),
+                ("app_label", models.CharField(max_length=100)),
                 (
-                    "expire_date",
-                    models.DateTimeField(verbose_name="expire date", db_index=True),
+                    "model",
+                    models.CharField(
+                        max_length=100, verbose_name="python model class name"
+                    ),
                 ),
             ],
             options={
-                "abstract": False,
-                "db_table": "django_session",
-                "verbose_name": "session",
-                "verbose_name_plural": "sessions",
+                "ordering": ("name",),
+                "db_table": "django_content_type",
+                "verbose_name": "content type",
+                "verbose_name_plural": "content types",
             },
+            bases=(models.Model,),
             managers=[
-                ("objects", django.contrib.sessions.models.SessionManager()),
+                ("objects", django.contrib.contenttypes.models.ContentTypeManager()),
             ],
+        ),
+        migrations.AlterUniqueTogether(
+            name="contenttype",
+            unique_together={("app_label", "model")},
         ),
     ]

@@ -1,26 +1,20 @@
 from django.conf import settings
-from django.contrib.messages.storage import default_storage
+from django.contrib.flatpages.views import flatpage
+from django.http import Http404
 from django.utils.deprecation import MiddlewareMixin
 
 
-class MessageMiddleware(MiddlewareMixin):
-    """
-    Middleware that handles temporary messages.
-    """
-
-    def process_request(self, request):
-        request._messages = default_storage(request)
-
+class FlatpageFallbackMiddleware(MiddlewareMixin):
     def process_response(self, request, response):
-        """
-        Update the storage backend (i.e., save the messages).
-
-        Raise ValueError if not all messages could be stored and DEBUG is True.
-        """
-        # A higher middleware layer may return a request which does not contain
-        # messages storage, so make no assumption that it will be there.
-        if hasattr(request, "_messages"):
-            unstored_messages = request._messages.update(response)
-            if unstored_messages and settings.DEBUG:
-                raise ValueError("Not all temporary messages could be stored.")
-        return response
+        if response.status_code != 404:
+            return response  # No need to check for a flatpage for non-404 responses.
+        try:
+            return flatpage(request, request.path_info)
+        # Return the original response if any errors happened. Because this
+        # is a middleware, we can't assume the errors will be caught elsewhere.
+        except Http404:
+            return response
+        except Exception:
+            if settings.DEBUG:
+                raise
+            return response

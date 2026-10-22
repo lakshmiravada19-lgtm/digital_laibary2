@@ -1,122 +1,179 @@
-"""
-Views and functions for serving static files. These are only to be used
-during development, and SHOULD NOT be used in a production setting.
-"""
+from urllib.parse import quote, urljoin
 
-import mimetypes
-import posixpath
-from pathlib import Path
+from django import template
+from django.apps import apps
+from django.utils.encoding import iri_to_uri
+from django.utils.html import conditional_escape
 
-from django.http import FileResponse, Http404, HttpResponse, HttpResponseNotModified
-from django.template import Context, Engine, TemplateDoesNotExist, loader
-from django.utils._os import safe_join
-from django.utils.http import http_date, parse_http_date
-from django.utils.translation import gettext as _
-from django.utils.translation import gettext_lazy
+register = template.Library()
 
 
-def builtin_template_path(name):
-    """
-    Return a path to a builtin template.
+class PrefixNode(template.Node):
+    def __repr__(self):
+        return "<PrefixNode for %r>" % self.name
 
-    Avoid calling this function at the module level or in a class-definition
-    because __file__ may not exist, e.g. in frozen environments.
-    """
-    return Path(__file__).parent / "templates" / name
-
-
-def serve(request, path, document_root=None, show_indexes=False):
-    """
-    Serve static files below a given point in the directory structure.
-
-    To use, put a URL pattern such as::
-
-        from django.views.static import serve
-
-        path('<path:path>', serve, {'document_root': '/path/to/my/files/'})
-
-    in your URLconf. You must provide the ``document_root`` param. You may
-    also set ``show_indexes`` to ``True`` if you'd like to serve a basic index
-    of the directory.  This index view will use the template hardcoded below,
-    but if you'd like to override it, you can create a template called
-    ``static/directory_index.html``.
-    """
-    path = posixpath.normpath(path).lstrip("/")
-    fullpath = Path(safe_join(document_root, path))
-    if fullpath.is_dir():
-        if show_indexes:
-            return directory_index(path, fullpath)
-        raise Http404(_("Directory indexes are not allowed here."))
-    if not fullpath.exists():
-        raise Http404(_("“%(path)s” does not exist") % {"path": fullpath})
-    # Respect the If-Modified-Since header.
-    statobj = fullpath.stat()
-    if not was_modified_since(
-        request.META.get("HTTP_IF_MODIFIED_SINCE"), statobj.st_mtime
-    ):
-        return HttpResponseNotModified()
-    content_type, encoding = mimetypes.guess_type(str(fullpath))
-    content_type = content_type or "application/octet-stream"
-    response = FileResponse(fullpath.open("rb"), content_type=content_type)
-    response.headers["Last-Modified"] = http_date(statobj.st_mtime)
-    if encoding:
-        response.headers["Content-Encoding"] = encoding
-    return response
-
-
-# Translatable string for static directory index template title.
-template_translatable = gettext_lazy("Index of %(directory)s")
-
-
-def directory_index(path, fullpath):
-    try:
-        t = loader.select_template(
-            [
-                "static/directory_index.html",
-                "static/directory_index",
-            ]
-        )
-    except TemplateDoesNotExist:
-        with builtin_template_path("directory_index.html").open(encoding="utf-8") as fh:
-            t = Engine(libraries={"i18n": "django.templatetags.i18n"}).from_string(
-                fh.read()
+    def __init__(self, varname=None, name=None):
+        if name is None:
+            raise template.TemplateSyntaxError(
+                "Prefix nodes must be given a name to return."
             )
-        c = Context()
-    else:
-        c = {}
-    files = []
-    for f in fullpath.iterdir():
-        if not f.name.startswith("."):
-            url = str(f.relative_to(fullpath))
-            if f.is_dir():
-                url += "/"
-            files.append(url)
-    c.update(
-        {
-            "directory": path + "/",
-            "file_list": files,
-        }
-    )
-    return HttpResponse(t.render(c))
+        self.varname = varname
+        self.name = name
+
+    @classmethod
+    def handle_token(cls, parser, token, name):
+        """
+        Class method to parse prefix node and return a Node.
+        """
+        # token.split_contents() isn't useful here because tags using this
+        # method don't accept variable as arguments.
+        tokens = token.contents.split()
+        if len(tokens) > 1 and tokens[1] != "as":
+            raise template.TemplateSyntaxError(
+                "First argument in '%s' must be 'as'" % tokens[0]
+            )
+        if len(tokens) > 1:
+            varname = tokens[2]
+        else:
+            varname = None
+        return cls(varname, name)
+
+    @classmethod
+    def handle_simple(cls, name):
+        try:
+            from django.conf import settings
+        except ImportError:
+            prefix = ""
+        else:
+            prefix = iri_to_uri(getattr(settings, name, ""))
+        return prefix
+
+    def render(self, context):
+        prefix = self.handle_simple(self.name)
+        if self.varname is None:
+            return prefix
+        context[self.varname] = prefix
+        return ""
 
 
-def was_modified_since(header=None, mtime=0):
+@register.tag
+def get_static_prefix(parser, token):
     """
-    Was something modified since the user last downloaded it?
+    Populate a template variable with the static prefix,
+    ``settings.STATIC_URL``.
 
-    header
-      This is the value of the If-Modified-Since header.  If this is None,
-      I'll just return True.
+    Usage::
 
-    mtime
-      This is the modification time of the item we're talking about.
+        {% get_static_prefix [as varname] %}
+
+    Examples::
+
+        {% get_static_prefix %}
+        {% get_static_prefix as static_prefix %}
     """
-    try:
-        if header is None:
-            raise ValueError
-        header_mtime = parse_http_date(header)
-        if int(mtime) > header_mtime:
-            raise ValueError
-    except (ValueError, OverflowError):
-        return True
-    return False
+    return PrefixNode.handle_token(parser, token, "STATIC_URL")
+
+
+@register.tag
+def get_media_prefix(parser, token):
+    """
+    Populate a template variable with the media prefix,
+    ``settings.MEDIA_URL``.
+
+    Usage::
+
+        {% get_media_prefix [as varname] %}
+
+    Examples::
+
+        {% get_media_prefix %}
+        {% get_media_prefix as media_prefix %}
+    """
+    return PrefixNode.handle_token(parser, token, "MEDIA_URL")
+
+
+class StaticNode(template.Node):
+    child_nodelists = ()
+
+    def __init__(self, varname=None, path=None):
+        if path is None:
+            raise template.TemplateSyntaxError(
+                "Static template nodes must be given a path to return."
+            )
+        self.path = path
+        self.varname = varname
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(varname={self.varname!r}, path={self.path!r})"
+        )
+
+    def url(self, context):
+        path = self.path.resolve(context)
+        return self.handle_simple(path)
+
+    def render(self, context):
+        url = self.url(context)
+        if context.autoescape:
+            url = conditional_escape(url)
+        if self.varname is None:
+            return url
+        context[self.varname] = url
+        return ""
+
+    @classmethod
+    def handle_simple(cls, path):
+        if apps.is_installed("django.contrib.staticfiles"):
+            from django.contrib.staticfiles.storage import staticfiles_storage
+
+            return staticfiles_storage.url(path)
+        else:
+            return urljoin(PrefixNode.handle_simple("STATIC_URL"), quote(path))
+
+    @classmethod
+    def handle_token(cls, parser, token):
+        """
+        Class method to parse prefix node and return a Node.
+        """
+        bits = token.split_contents()
+
+        if len(bits) < 2:
+            raise template.TemplateSyntaxError(
+                "'%s' takes at least one argument (path to file)" % bits[0]
+            )
+
+        path = parser.compile_filter(bits[1])
+
+        if len(bits) >= 2 and bits[-2] == "as":
+            varname = bits[3]
+        else:
+            varname = None
+
+        return cls(varname, path)
+
+
+@register.tag("static")
+def do_static(parser, token):
+    """
+    Join the given path with the STATIC_URL setting.
+
+    Usage::
+
+        {% static path [as varname] %}
+
+    Examples::
+
+        {% static "myapp/css/base.css" %}
+        {% static variable_with_path %}
+        {% static "myapp/css/base.css" as admin_base_css %}
+        {% static variable_with_path as varname %}
+    """
+    return StaticNode.handle_token(parser, token)
+
+
+def static(path):
+    """
+    Given a relative path to a static asset, return the absolute path to the
+    asset.
+    """
+    return StaticNode.handle_simple(path)

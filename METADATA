@@ -1,16 +1,16 @@
-Metadata-Version: 2.4
-Name: asgiref
-Version: 3.12.1
-Summary: ASGI specs, helper code, and adapters
-Home-page: https://github.com/django/asgiref/
-Author: Django Software Foundation
-Author-email: foundation@djangoproject.com
-License: BSD-3-Clause
-Project-URL: Documentation, https://asgi.readthedocs.io/
-Project-URL: Further Documentation, https://docs.djangoproject.com/en/stable/topics/async/#async-adapter-functions
-Project-URL: Changelog, https://github.com/django/asgiref/blob/master/CHANGELOG.txt
+Metadata-Version: 2.5
+Name: sqlparse
+Version: 0.6.0
+Summary: A non-validating SQL parser.
+Project-URL: Home, https://github.com/andialbrecht/sqlparse
+Project-URL: Documentation, https://sqlparse.readthedocs.io/
+Project-URL: Release Notes, https://sqlparse.readthedocs.io/en/latest/changes.html
+Project-URL: Source, https://github.com/andialbrecht/sqlparse
+Project-URL: Tracker, https://github.com/andialbrecht/sqlparse/issues
+Author-email: Andi Albrecht <albrecht.andi@gmail.com>
+License-File: AUTHORS
+License-File: LICENSE
 Classifier: Development Status :: 5 - Production/Stable
-Classifier: Environment :: Web Environment
 Classifier: Intended Audience :: Developers
 Classifier: License :: OSI Approved :: BSD License
 Classifier: Operating System :: OS Independent
@@ -22,228 +22,154 @@ Classifier: Programming Language :: Python :: 3.11
 Classifier: Programming Language :: Python :: 3.12
 Classifier: Programming Language :: Python :: 3.13
 Classifier: Programming Language :: Python :: 3.14
-Classifier: Programming Language :: Python :: Free Threading :: 2 - Beta
-Classifier: Topic :: Internet :: WWW/HTTP
+Classifier: Programming Language :: Python :: Implementation :: CPython
+Classifier: Programming Language :: Python :: Implementation :: PyPy
+Classifier: Topic :: Database
+Classifier: Topic :: Software Development
 Requires-Python: >=3.10
-License-File: LICENSE
-Requires-Dist: typing_extensions>=4; python_version < "3.11"
-Provides-Extra: tests
-Requires-Dist: pytest; extra == "tests"
-Requires-Dist: pytest-asyncio; extra == "tests"
-Provides-Extra: mypy
-Requires-Dist: mypy>=1.14.0; extra == "mypy"
-Dynamic: license-file
+Provides-Extra: dev
+Requires-Dist: build; extra == 'dev'
+Provides-Extra: doc
+Requires-Dist: furo; extra == 'doc'
+Requires-Dist: sphinx; extra == 'doc'
+Description-Content-Type: text/markdown
 
-asgiref
-=======
+# sqlparse
 
-.. image:: https://github.com/django/asgiref/actions/workflows/tests.yml/badge.svg
-    :target: https://github.com/django/asgiref/actions/workflows/tests.yml
+[![Build Status](https://github.com/andialbrecht/sqlparse/actions/workflows/python-app.yml/badge.svg)](https://github.com/andialbrecht/sqlparse/actions/workflows/python-app.yml)
+[![Coverage](https://codecov.io/gh/andialbrecht/sqlparse/branch/master/graph/badge.svg)](https://codecov.io/gh/andialbrecht/sqlparse)
+[![Documentation](https://readthedocs.org/projects/sqlparse/badge/?version=latest)](https://sqlparse.readthedocs.io/en/latest/)
+[![PyPI](https://img.shields.io/pypi/v/sqlparse?color=%2334D058&label=pypi%20package)](https://pypi.org/project/sqlparse)
+[![Python versions](https://img.shields.io/pypi/pyversions/sqlparse)](https://pypi.org/project/sqlparse)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](https://opensource.org/licenses/BSD-3-Clause)
+
+A non-validating SQL parser for Python. Split scripts into statements, format
+them, and walk their token tree.
+
+sqlparse tokenizes SQL text and groups the parts it recognizes into a tree of
+statements, clauses, identifiers and expressions. It accepts any input without
+validating it, and makes no assumptions about a particular SQL dialect, so
+vendor extensions and templated SQL parse too. It is a building block for
+formatters, linters, editors and query analysis tools.
 
-.. image:: https://img.shields.io/pypi/v/asgiref.svg
-    :target: https://pypi.python.org/pypi/asgiref
+Licensed under the
+[New BSD license](https://opensource.org/licenses/BSD-3-Clause).
+
+## Install
+
+```bash
+pip install sqlparse
+```
+
+## Usage
 
-ASGI is a standard for Python asynchronous web apps and servers to communicate
-with each other, and positioned as an asynchronous successor to WSGI. You can
-read more at https://asgi.readthedocs.io/en/latest/
+Three module-level functions cover most needs: `split()`, `format()` and
+`parse()`.
 
-This package includes ASGI base libraries, such as:
+### Split a script into statements
 
-* Sync-to-async and async-to-sync function wrappers, ``asgiref.sync``
-* Server base classes, ``asgiref.server``
-* A WSGI-to-ASGI adapter, in ``asgiref.wsgi``
+```python
+import sqlparse
 
+sqlparse.split("select * from foo; select * from bar;")
+# ['select * from foo;', 'select * from bar;']
+```
 
-Function wrappers
------------------
+### Format a statement
 
-These allow you to wrap or decorate async or sync functions to call them from
-the other style (so you can call async functions from a synchronous thread,
-or vice-versa).
+```python
+print(sqlparse.format("select id,name from users where active=1",
+                      reindent=True, keyword_case="upper"))
+```
 
-In particular:
+```sql
+SELECT id,
+       name
+FROM users
+WHERE active=1
+```
 
-* AsyncToSync lets a synchronous subthread stop and wait while the async
-  function is called on the main thread's event loop, and then control is
-  returned to the thread when the async function is finished.
+`format()` accepts the same options as the command line, among them
+`reindent`, `keyword_case`, `strip_comments` and `indent_width`.
 
-* SyncToAsync lets async code call a synchronous function, which is run in
-  a threadpool and control returned to the async coroutine when the synchronous
-  function completes.
+### Parse and inspect a statement
 
-The idea is to make it easier to call synchronous APIs from async code and
-asynchronous APIs from synchronous code so it's easier to transition code from
-one style to the other. In the case of Channels, we wrap the (synchronous)
-Django view system with SyncToAsync to allow it to run inside the (asynchronous)
-ASGI server.
+```python
+statement = sqlparse.parse("select id, name from users where active = 1")[0]
 
-Note that exactly what threads things run in is very specific, and aimed to
-keep maximum compatibility with old synchronous code. See
-"Synchronous code & Threads" below for a full explanation. By default,
-``sync_to_async`` will run all synchronous code in the program in the same
-thread for safety reasons; you can disable this for more performance with
-``@sync_to_async(thread_sensitive=False)``, but make sure that your code does
-not rely on anything bound to threads (like database connections) when you do.
+print(statement.get_type())
+for token in statement.tokens:
+    if not token.is_whitespace:
+        print(f"{token.ttype or type(token).__name__!s:20} {token!s}")
+```
 
+```
+SELECT
+Token.Keyword.DML    select
+IdentifierList       id, name
+Token.Keyword        from
+Identifier           users
+Where                where active = 1
+```
 
-Threadlocal replacement
------------------------
+Tokens with a `ttype` are leaves. The others are groups you can descend into,
+which is how nested constructs like subqueries and `CASE` expressions are
+represented. See
+[Analyzing SQL statements](https://sqlparse.readthedocs.io/en/latest/analyzing.html)
+for the traversal API.
 
-This is a drop-in replacement for ``threading.local`` that works with both
-threads and asyncio Tasks. Even better, it will proxy values through from a
-task-local context to a thread-local context when you use ``sync_to_async``
-to run things in a threadpool, and vice-versa for ``async_to_sync``.
+## Command line
 
-If you instead want true thread- and task-safety, you can set
-``thread_critical`` on the Local object to ensure this instead.
+Installing sqlparse also provides the `sqlformat` command. It reads from stdin
+when the filename is `-`, writes to stdout by default, and rewrites files in
+place with `--in-place`:
 
+```bash
+sqlformat --reindent --keywords upper query.sql
+```
 
-Server base classes
--------------------
+Run `sqlformat --help` for all formatting options.
 
-Includes a ``StatelessServer`` class which provides all the hard work of
-writing a stateless server (as in, does not handle direct incoming sockets
-but instead consumes external streams or sockets to work out what is happening).
+## Pre-commit hook
 
-An example of such a server would be a chatbot server that connects out to
-a central chat server and provides a "connection scope" per user chatting to
-it. There's only one actual connection, but the server has to separate things
-into several scopes for easier writing of the code.
+Format SQL files on commit with [pre-commit](https://pre-commit.com/):
 
-You can see an example of this being used in `frequensgi <https://github.com/andrewgodwin/frequensgi>`_.
+```yaml
+repos:
+  - repo: https://github.com/andialbrecht/sqlparse
+    rev: 0.5.5  # use the latest release
+    hooks:
+      - id: sqlformat
+        args: [--in-place, --reindent, --keywords, upper]
+```
 
+The hook defaults to `--in-place --reindent`. When overriding `args`, keep
+`--in-place`, or the hook writes to stdout and leaves your files unchanged.
 
-WSGI-to-ASGI adapter
---------------------
+## Links
 
-Allows you to wrap a WSGI application so it appears as a valid ASGI application.
+| | |
+|---|---|
+| Documentation | <https://sqlparse.readthedocs.io/> |
+| Release notes | <https://sqlparse.readthedocs.io/en/latest/changes.html> |
+| Issues | <https://github.com/andialbrecht/sqlparse/issues> |
+| Discussions | <https://github.com/andialbrecht/sqlparse/discussions> |
+| Online demo | <https://sqlformat.org/> |
 
-Simply wrap it around your WSGI application like so::
+## Contributing
 
-    asgi_application = WsgiToAsgi(wsgi_application)
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) to get
+started.
 
-The WSGI application will be run in a synchronous threadpool, and the wrapped
-ASGI application will be one that accepts ``http`` class messages.
+sqlparse is maintained in spare time, so it can take a while before an issue or
+pull request gets a reply. Thanks for your patience. A pull request that comes
+with tests for the behavior it changes is usually the quickest to review.
 
-Please note that not all extended features of WSGI may be supported (such as
-file handles for incoming POST bodies).
+For security issues, please follow [SECURITY.md](SECURITY.md) rather than
+opening a public issue.
 
+## License
 
-Dependencies
-------------
-
-``asgiref`` requires Python 3.10 or higher.
-
-
-Contributing
-------------
-
-Please refer to the
-`main Channels contributing docs <https://github.com/django/channels/blob/master/CONTRIBUTING.rst>`_.
-
-
-Testing
-'''''''
-
-To run tests, make sure you have installed the ``tests`` extra with the package::
-
-    cd asgiref/
-    pip install -e .[tests]
-    pytest
-
-
-Building the documentation
-''''''''''''''''''''''''''
-
-The documentation uses `Sphinx <http://www.sphinx-doc.org>`_::
-
-    cd asgiref/docs/
-    pip install sphinx
-
-To build the docs, you can use the default tools::
-
-    sphinx-build -b html . _build/html  # or `make html`, if you've got make set up
-    cd _build/html
-    python -m http.server
-
-...or you can use ``sphinx-autobuild`` to run a server and rebuild/reload
-your documentation changes automatically::
-
-    pip install sphinx-autobuild
-    sphinx-autobuild . _build/html
-
-
-Releasing
-'''''''''
-
-To release, first add details to CHANGELOG.txt and update the version number in ``asgiref/__init__.py``.
-
-Then, build and push the packages::
-
-    python -m build
-    twine upload dist/*
-    rm -r asgiref.egg-info dist
-
-
-Implementation Details
-----------------------
-
-Synchronous code & threads
-''''''''''''''''''''''''''
-
-The ``asgiref.sync`` module provides two wrappers that let you go between
-asynchronous and synchronous code at will, while taking care of the rough edges
-for you.
-
-Unfortunately, the rough edges are numerous, and the code has to work especially
-hard to keep things in the same thread as much as possible. Notably, the
-restrictions we are working with are:
-
-* All synchronous code called through ``SyncToAsync`` and marked with
-  ``thread_sensitive`` should run in the same thread as each other (and if the
-  outer layer of the program is synchronous, the main thread)
-
-* If a thread already has a running async loop, ``AsyncToSync`` can't run things
-  on that loop if it's blocked on synchronous code that is above you in the
-  call stack.
-
-The first compromise you get to might be that ``thread_sensitive`` code should
-just run in the same thread and not spawn in a sub-thread, fulfilling the first
-restriction, but that immediately runs you into the second restriction.
-
-The only real solution is to essentially have a variant of ThreadPoolExecutor
-that executes any ``thread_sensitive`` code on the outermost synchronous
-thread - either the main thread, or a single spawned subthread.
-
-This means you now have two basic states:
-
-* If the outermost layer of your program is synchronous, then all async code
-  run through ``AsyncToSync`` will run in a per-call event loop in arbitrary
-  sub-threads, while all ``thread_sensitive`` code will run in the main thread.
-
-* If the outermost layer of your program is asynchronous, then all async code
-  runs on the main thread's event loop, and all ``thread_sensitive`` synchronous
-  code will run in a single shared sub-thread.
-
-Crucially, this means that in both cases there is a thread which is a shared
-resource that all ``thread_sensitive`` code must run on, and there is a chance
-that this thread is currently blocked on its own ``AsyncToSync`` call. Thus,
-``AsyncToSync`` needs to act as an executor for thread code while it's blocking.
-
-The ``CurrentThreadExecutor`` class provides this functionality; rather than
-simply waiting on a Future, you can call its ``run_until_future`` method and
-it will run submitted code until that Future is done. This means that code
-inside the call can then run code on your thread.
-
-
-Maintenance and Security
-------------------------
-
-To report security issues, please contact security@djangoproject.com. For GPG
-signatures and more security process information, see
-https://docs.djangoproject.com/en/dev/internals/security/.
-
-To report bugs or request new features, please open a new GitHub issue.
-
-This repository is part of the Channels project. For the shepherd and maintenance team, please see the
-`main Channels readme <https://github.com/django/channels/blob/master/README.rst>`_.
+sqlparse is licensed under the New BSD license; see [LICENSE](LICENSE) for the
+full text. Parts of the code are based on [Pygments](https://pygments.org/),
+written by Georg Brandl and others.

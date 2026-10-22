@@ -1,207 +1,197 @@
-from io import IOBase
+import sys
+from collections import defaultdict
+from tempfile import SpooledTemporaryFile
 
-from django.conf import settings
-from django.core import signals
-from django.core.handlers import base
-from django.http import HttpRequest, QueryDict, parse_cookie
-from django.urls import set_script_prefix
-from django.utils.encoding import repercent_broken_unicode
-from django.utils.functional import cached_property
-from django.utils.regex_helper import _lazy_re_compile
-
-_slashes_re = _lazy_re_compile(rb"/+")
+from asgiref.sync import AsyncToSync, sync_to_async
 
 
-class LimitedStream(IOBase):
+class WsgiToAsgi:
     """
-    Wrap another stream to disallow reading it past a number of bytes.
-
-    Based on the implementation from werkzeug.wsgi.LimitedStream
-    See https://github.com/pallets/werkzeug/blob/dbf78f67/src/werkzeug/wsgi.py#L828
+    Wraps a WSGI application to make it into an ASGI application.
     """
 
-    def __init__(self, stream, limit):
-        self._read = stream.read
-        self._readline = stream.readline
-        self._pos = 0
-        self.limit = limit
+    def __init__(self, wsgi_application, duplicate_header_limit=100):
+        self.wsgi_application = wsgi_application
+        self.duplicate_header_limit = duplicate_header_limit
 
-    def read(self, size=-1, /):
-        _pos = self._pos
-        limit = self.limit
-        if _pos >= limit:
-            return b""
-        if size == -1 or size is None:
-            size = limit - _pos
+    async def __call__(self, scope, receive, send):
+        """
+        ASGI application instantiation point.
+        We return a new WsgiToAsgiInstance here with the WSGI app
+        and the scope, ready to respond when it is __call__ed.
+        """
+        await WsgiToAsgiInstance(self.wsgi_application, self.duplicate_header_limit)(
+            scope, receive, send
+        )
+
+
+class WsgiToAsgiInstance:
+    """
+    Per-socket instance of a wrapped WSGI application
+    """
+
+    def __init__(self, wsgi_application, duplicate_header_limit=100):
+        self.wsgi_application = wsgi_application
+        self.duplicate_header_limit = duplicate_header_limit
+        self.response_started = False
+        self.response_content_length = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            raise ValueError("WSGI wrapper received a non-HTTP scope")
+        self.scope = scope
+        with SpooledTemporaryFile(max_size=65536) as body:
+            # Alright, wait for the http.request messages
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    raise ValueError("WSGI wrapper received a non-HTTP-request message")
+                body.write(message.get("body", b""))
+                if not message.get("more_body"):
+                    break
+            body.seek(0)
+            # Wrap send so it can be called from the subthread
+            self.sync_send = AsyncToSync(send)
+            # Call the WSGI app
+            await self.run_wsgi_app(body)
+
+    def build_environ(self, scope, body):
+        """
+        Builds a scope and request body into a WSGI environ object.
+        """
+        script_name = scope.get("root_path", "").encode("utf8").decode("latin1")
+        path_info = scope["path"].encode("utf8").decode("latin1")
+        if path_info.startswith(script_name):
+            path_info = path_info[len(script_name) :]
+        environ = {
+            "REQUEST_METHOD": scope["method"],
+            "SCRIPT_NAME": script_name,
+            "PATH_INFO": path_info,
+            "QUERY_STRING": scope["query_string"].decode("ascii"),
+            "SERVER_PROTOCOL": "HTTP/%s" % scope["http_version"],
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": scope.get("scheme", "http"),
+            "wsgi.input": body,
+            "wsgi.errors": sys.stderr,
+            "wsgi.multithread": True,
+            "wsgi.multiprocess": True,
+            "wsgi.run_once": False,
+        }
+        # Get server name and port - required in WSGI, not in ASGI
+        if "server" in scope:
+            environ["SERVER_NAME"] = scope["server"][0]
+            environ["SERVER_PORT"] = str(scope["server"][1])
         else:
-            size = min(size, limit - _pos)
-        data = self._read(size)
-        self._pos += len(data)
-        return data
+            environ["SERVER_NAME"] = "localhost"
+            environ["SERVER_PORT"] = "80"
 
-    def readline(self, size=-1, /):
-        _pos = self._pos
-        limit = self.limit
-        if _pos >= limit:
-            return b""
-        if size == -1 or size is None:
-            size = limit - _pos
-        else:
-            size = min(size, limit - _pos)
-        line = self._readline(size)
-        self._pos += len(line)
-        return line
+        if scope.get("client") is not None:
+            environ["REMOTE_ADDR"] = scope["client"][0]
 
+        # Go through headers and make them into environ entries
+        _headers = defaultdict(list)
+        for name, value in self.scope.get("headers", []):
+            name = name.decode("latin1")
+            if name == "content-length":
+                corrected_name = "CONTENT_LENGTH"
+            elif name == "content-type":
+                corrected_name = "CONTENT_TYPE"
+            else:
+                corrected_name = "HTTP_%s" % name.upper().replace("-", "_")
+            # HTTPbis say only ASCII chars are allowed in headers, but we latin1 just in case
+            value = value.decode("latin1")
+            if (
+                self.duplicate_header_limit
+                and len(_headers[corrected_name]) >= self.duplicate_header_limit
+            ):
+                raise ValueError(
+                    f"Too many duplicate headers: {corrected_name} exceeds limit of"
+                    f"{self.duplicate_header_limit}"
+                )
+            _headers[corrected_name].append(value)
+        for name, values in _headers.items():
+            environ[name] = ",".join(values)
+        return environ
 
-class WSGIRequest(HttpRequest):
-    def __init__(self, environ):
-        script_name = get_script_name(environ)
-        # If PATH_INFO is empty (e.g. accessing the SCRIPT_NAME URL without a
-        # trailing slash), operate as if '/' was requested.
-        path_info = get_path_info(environ) or "/"
-        self.environ = environ
-        self.path_info = path_info
-        # be careful to only replace the first slash in the path because of
-        # http://test/something and http://test//something being different as
-        # stated in RFC 3986.
-        self.path = "%s/%s" % (script_name.rstrip("/"), path_info.replace("/", "", 1))
-        self.META = environ
-        self.META["PATH_INFO"] = path_info
-        self.META["SCRIPT_NAME"] = script_name
-        self.method = environ["REQUEST_METHOD"].upper()
-        # Set content_type, content_params, and encoding.
-        self._set_content_type_params(environ)
-        try:
-            content_length = int(environ.get("CONTENT_LENGTH"))
-        except (ValueError, TypeError):
-            content_length = 0
-        self._stream = LimitedStream(self.environ["wsgi.input"], content_length)
-        self._read_started = False
-        self.resolver_match = None
-
-    def _get_scheme(self):
-        return self.environ.get("wsgi.url_scheme")
-
-    @cached_property
-    def GET(self):
-        # The WSGI spec says 'QUERY_STRING' may be absent.
-        raw_query_string = get_bytes_from_wsgi(self.environ, "QUERY_STRING", "")
-        return QueryDict(raw_query_string, encoding=self._encoding)
-
-    def _get_post(self):
-        if not hasattr(self, "_post"):
-            self._load_post_and_files()
-        return self._post
-
-    def _set_post(self, post):
-        self._post = post
-
-    @cached_property
-    def COOKIES(self):
-        raw_cookie = get_str_from_wsgi(self.environ, "HTTP_COOKIE", "")
-        return parse_cookie(raw_cookie)
-
-    @property
-    def FILES(self):
-        if not hasattr(self, "_files"):
-            self._load_post_and_files()
-        return self._files
-
-    POST = property(_get_post, _set_post)
-
-
-class WSGIHandler(base.BaseHandler):
-    request_class = WSGIRequest
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.load_middleware()
-
-    def __call__(self, environ, start_response):
-        set_script_prefix(get_script_name(environ))
-        signals.request_started.send(sender=self.__class__, environ=environ)
-        request = self.request_class(environ)
-        response = self.get_response(request)
-
-        response._handler_class = self.__class__
-
-        status = "%d %s" % (response.status_code, response.reason_phrase)
-        response_headers = [
-            *response.items(),
-            *(("Set-Cookie", c.output(header="")) for c in response.cookies.values()),
-        ]
-        start_response(status, response_headers)
-        if getattr(response, "file_to_stream", None) is not None and environ.get(
-            "wsgi.file_wrapper"
-        ):
-            # If `wsgi.file_wrapper` is used the WSGI server does not call
-            # .close on the response, but on the file wrapper. Patch it to use
-            # response.close instead which takes care of closing all files.
-            response.file_to_stream.close = response.close
-            response = environ["wsgi.file_wrapper"](
-                response.file_to_stream, response.block_size
+    def start_response(self, status, response_headers, exc_info=None):
+        """
+        WSGI start_response callable.
+        """
+        # Don't allow re-calling once response has begun
+        if self.response_started:
+            raise exc_info[1].with_traceback(exc_info[2])
+        # Don't allow re-calling without exc_info
+        if hasattr(self, "response_start") and exc_info is None:
+            raise ValueError(
+                "You cannot call start_response a second time without exc_info"
             )
-        return response
+        # Extract status code
+        status_code, _ = status.split(" ", 1)
+        status_code = int(status_code)
+        # Extract headers
+        headers = [
+            (name.lower().encode("ascii"), value.encode("ascii"))
+            for name, value in response_headers
+        ]
+        # Extract content-length
+        self.response_content_length = None
+        for name, value in response_headers:
+            if name.lower() == "content-length":
+                self.response_content_length = int(value)
+        # Build and send response start message.
+        self.response_start = {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": headers,
+        }
 
-
-def get_path_info(environ):
-    """Return the HTTP request's PATH_INFO as a string."""
-    path_info = get_bytes_from_wsgi(environ, "PATH_INFO", "/")
-
-    return repercent_broken_unicode(path_info).decode()
-
-
-def get_script_name(environ):
-    """
-    Return the equivalent of the HTTP request's SCRIPT_NAME environment
-    variable. If Apache mod_rewrite is used, return what would have been
-    the script name prior to any rewriting (so it's the script name as seen
-    from the client's perspective), unless the FORCE_SCRIPT_NAME setting is
-    set (to anything).
-    """
-    if settings.FORCE_SCRIPT_NAME is not None:
-        return settings.FORCE_SCRIPT_NAME
-
-    # If Apache's mod_rewrite had a whack at the URL, Apache set either
-    # SCRIPT_URL or REDIRECT_URL to the full resource URL before applying any
-    # rewrites. Unfortunately not every web server (lighttpd!) passes this
-    # information through all the time, so FORCE_SCRIPT_NAME, above, is still
-    # needed.
-    script_url = get_bytes_from_wsgi(environ, "SCRIPT_URL", "") or get_bytes_from_wsgi(
-        environ, "REDIRECT_URL", ""
-    )
-
-    if script_url:
-        if b"//" in script_url:
-            # mod_wsgi squashes multiple successive slashes in PATH_INFO,
-            # do the same with script_url before manipulating paths (#17133).
-            script_url = _slashes_re.sub(b"/", script_url)
-        path_info = get_bytes_from_wsgi(environ, "PATH_INFO", "")
-        script_name = script_url.removesuffix(path_info)
-    else:
-        script_name = get_bytes_from_wsgi(environ, "SCRIPT_NAME", "")
-
-    return script_name.decode()
-
-
-def get_bytes_from_wsgi(environ, key, default):
-    """
-    Get a value from the WSGI environ dictionary as bytes.
-
-    key and default should be strings.
-    """
-    value = environ.get(key, default)
-    # Non-ASCII values in the WSGI environ are arbitrarily decoded with
-    # ISO-8859-1. This is wrong for Django websites where UTF-8 is the default.
-    # Re-encode to recover the original bytestring.
-    return value.encode("iso-8859-1")
-
-
-def get_str_from_wsgi(environ, key, default):
-    """
-    Get a value from the WSGI environ dictionary as str.
-
-    key and default should be str objects.
-    """
-    value = get_bytes_from_wsgi(environ, key, default)
-    return value.decode(errors="replace")
+    @sync_to_async
+    def run_wsgi_app(self, body):
+        """
+        Called in a subthread to run the WSGI app. We encapsulate like
+        this so that the start_response callable is called in the same thread.
+        """
+        # Translate the scope and incoming request body into a WSGI environ
+        try:
+            environ = self.build_environ(self.scope, body)
+        except ValueError:
+            # Return 400 Bad Request if header limit exceeded
+            self.sync_send(
+                {
+                    "type": "http.response.start",
+                    "status": 400,
+                    "headers": [(b"content-type", b"text/plain")],
+                }
+            )
+            self.sync_send(
+                {
+                    "type": "http.response.body",
+                    "body": b"Bad Request: Too many duplicate headers",
+                }
+            )
+            return
+        # Run the WSGI app
+        bytes_sent = 0
+        for output in self.wsgi_application(environ, self.start_response):
+            # If this is the first response, include the response headers
+            if not self.response_started:
+                self.response_started = True
+                self.sync_send(self.response_start)
+            # If the application supplies a Content-Length header
+            if self.response_content_length is not None:
+                # The server should not transmit more bytes to the client than the header allows
+                bytes_allowed = self.response_content_length - bytes_sent
+                if len(output) > bytes_allowed:
+                    output = output[:bytes_allowed]
+            self.sync_send(
+                {"type": "http.response.body", "body": output, "more_body": True}
+            )
+            bytes_sent += len(output)
+            # The server should stop iterating over the response when enough data has been sent
+            if bytes_sent == self.response_content_length:
+                break
+        # Close connection
+        if not self.response_started:
+            self.response_started = True
+            self.sync_send(self.response_start)
+        self.sync_send({"type": "http.response.body"})

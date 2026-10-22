@@ -1,9 +1,16 @@
-from django.urls import include
-from django.views import defaults
+#
+# Copyright (C) 2009-2020 the sqlparse authors and contributors
+# <see AUTHORS file>
+#
+# This module is part of python-sqlparse and is released under
+# the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
-__all__ = ["handler400", "handler403", "handler404", "handler500", "include"]
+from sqlparse.engine import grouping
+from sqlparse.engine.filter_stack import FilterStack
+from sqlparse.engine.statement_splitter import StatementSplitter
 
-handler400 = defaults.bad_request
-handler403 = defaults.permission_denied
-handler404 = defaults.page_not_found
-handler500 = defaults.server_error
+__all__ = [
+    'FilterStack',
+    'StatementSplitter',
+    'grouping',
+]

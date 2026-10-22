@@ -1,79 +1,47 @@
-from ctypes.util import find_library
+from inspect import getfullargspec
 
-from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
-from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteDatabaseWrapper
-
-from .client import SpatiaLiteClient
-from .features import DatabaseFeatures
-from .introspection import SpatiaLiteIntrospection
-from .operations import SpatiaLiteOperations
-from .schema import SpatialiteSchemaEditor
+from django.template.library import InclusionNode, parse_bits
+from django.utils.inspect import lazy_annotations
 
 
-class DatabaseWrapper(SQLiteDatabaseWrapper):
-    SchemaEditorClass = SpatialiteSchemaEditor
-    # Classes instantiated in __init__().
-    client_class = SpatiaLiteClient
-    features_class = DatabaseFeatures
-    introspection_class = SpatiaLiteIntrospection
-    ops_class = SpatiaLiteOperations
+class InclusionAdminNode(InclusionNode):
+    """
+    Template tag that allows its template to be overridden per model, per app,
+    or globally.
+    """
 
-    def __init__(self, *args, **kwargs):
-        # Trying to find the location of the SpatiaLite library.
-        # Here we are figuring out the path to the SpatiaLite library
-        # (`libspatialite`). If it's not in the system library path (e.g., it
-        # cannot be found by `ctypes.util.find_library`), then it may be set
-        # manually in the settings via the `SPATIALITE_LIBRARY_PATH` setting.
-        self.lib_spatialite_paths = [
-            name
-            for name in [
-                getattr(settings, "SPATIALITE_LIBRARY_PATH", None),
-                "mod_spatialite.so",
-                "mod_spatialite",
-                find_library("spatialite"),
+    def __init__(self, parser, token, func, template_name, takes_context=True):
+        self.template_name = template_name
+        with lazy_annotations():
+            params, varargs, varkw, defaults, kwonly, kwonly_defaults, _ = (
+                getfullargspec(func)
+            )
+        bits = token.split_contents()
+        args, kwargs = parse_bits(
+            parser,
+            bits[1:],
+            params,
+            varargs,
+            varkw,
+            defaults,
+            kwonly,
+            kwonly_defaults,
+            takes_context,
+            bits[0],
+        )
+        super().__init__(func, takes_context, args, kwargs, filename=None)
+
+    def render(self, context):
+        opts = context["opts"]
+        app_label = opts.app_label.lower()
+        object_name = opts.model_name
+        # Load template for this render call. (Setting self.filename isn't
+        # thread-safe.)
+        context.render_context[self] = context.template.engine.select_template(
+            [
+                "admin/%s/%s/%s" % (app_label, object_name, self.template_name),
+                "admin/%s/%s" % (app_label, self.template_name),
+                "admin/%s" % self.template_name,
             ]
-            if name is not None
-        ]
-        super().__init__(*args, **kwargs)
-
-    def get_new_connection(self, conn_params):
-        conn = super().get_new_connection(conn_params)
-        # Enabling extension loading on the SQLite connection.
-        try:
-            conn.enable_load_extension(True)
-        except AttributeError:
-            raise ImproperlyConfigured(
-                "SpatiaLite requires SQLite to be configured to allow "
-                "extension loading."
-            )
-        # Load the SpatiaLite library extension on the connection.
-        for path in self.lib_spatialite_paths:
-            try:
-                conn.load_extension(path)
-            except Exception:
-                if getattr(settings, "SPATIALITE_LIBRARY_PATH", None):
-                    raise ImproperlyConfigured(
-                        "Unable to load the SpatiaLite library extension "
-                        "as specified in your SPATIALITE_LIBRARY_PATH setting."
-                    )
-                continue
-            else:
-                break
-        else:
-            raise ImproperlyConfigured(
-                "Unable to load the SpatiaLite library extension. "
-                "Library names tried: %s" % ", ".join(self.lib_spatialite_paths)
-            )
-        return conn
-
-    def prepare_database(self):
-        super().prepare_database()
-        # Check if spatial metadata have been initialized in the database
-        with self.cursor() as cursor:
-            cursor.execute("PRAGMA table_info(geometry_columns);")
-            if cursor.fetchall() == []:
-                if self.ops.spatial_version < (5,):
-                    cursor.execute("SELECT InitSpatialMetaData(1)")
-                else:
-                    cursor.execute("SELECT InitSpatialMetaDataFull(1)")
+        )
+        return super().render(context)

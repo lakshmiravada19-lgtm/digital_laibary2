@@ -1,165 +1,233 @@
-from datetime import timedelta
-from decimal import Decimal
+from contextlib import contextmanager
 
-from django.contrib.auth import get_user_model
-from django.test import TestCase
-from django.urls import reverse
-from django.utils import timezone
+from django.contrib.staticfiles.testing import StaticLiveServerTestCase
+from django.test import modify_settings
+from django.test.selenium import SeleniumTestCase
+from django.utils.deprecation import MiddlewareMixin
+from django.utils.translation import gettext as _
 
-from .models import Author, Book, CirculationRecord, Member
+# Make unittest ignore frames in this module when reporting failures.
+__unittest = True
 
 
-class CirculationWorkflowTests(TestCase):
-    def setUp(self):
-        self.staff = get_user_model().objects.create_user(
-            username="librarian", password="test-password", is_staff=True
+class CSPMiddleware(MiddlewareMixin):
+    """The admin's JavaScript should be compatible with CSP."""
+
+    def process_response(self, request, response):
+        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        return response
+
+
+@modify_settings(MIDDLEWARE={"append": "django.contrib.admin.tests.CSPMiddleware"})
+class AdminSeleniumTestCase(SeleniumTestCase, StaticLiveServerTestCase):
+    available_apps = [
+        "django.contrib.admin",
+        "django.contrib.auth",
+        "django.contrib.contenttypes",
+        "django.contrib.sessions",
+        "django.contrib.sites",
+    ]
+
+    def wait_until(self, callback, timeout=10):
+        """
+        Block the execution of the tests until the specified callback returns a
+        value that is not falsy. This method can be called, for example, after
+        clicking a link or submitting a form. See the other public methods that
+        call this function for more details.
+        """
+        from selenium.webdriver.support.wait import WebDriverWait
+
+        WebDriverWait(self.selenium, timeout).until(callback)
+
+    def wait_for_and_switch_to_popup(self, num_windows=2, timeout=10):
+        """
+        Block until `num_windows` are present and are ready (usually 2, but can
+        be overridden in the case of pop-ups opening other pop-ups). Switch the
+        current window to the new pop-up.
+        """
+        self.wait_until(lambda d: len(d.window_handles) == num_windows, timeout)
+        self.selenium.switch_to.window(self.selenium.window_handles[-1])
+        self.wait_page_ready()
+
+    def wait_for(self, css_selector, timeout=10):
+        """
+        Block until a CSS selector is found on the page.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as ec
+
+        self.wait_until(
+            ec.presence_of_element_located((By.CSS_SELECTOR, css_selector)), timeout
         )
-        self.author = Author.objects.create(name="Test Author")
-        self.book = Book.objects.create(
-            title="Test Book",
-            author=self.author,
-            isbn="9781234567890",
-            genre="Fiction",
-            total_copies=1,
-            available_copies=1,
-        )
-        self.member = Member.objects.create(
-            name="Test Member",
-            member_id="MEM-1",
-            email="member@example.com",
-        )
-        self.client.force_login(self.staff)
 
-    def test_issue_reduces_inventory_and_sets_fourteen_day_due_date(self):
-        response = self.client.post(
-            reverse("circulation"),
-            {"book": self.book.pk, "member": self.member.pk},
+    def wait_for_text(self, css_selector, text, timeout=10):
+        """
+        Block until the text is found in the CSS selector.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as ec
+
+        self.wait_until(
+            ec.text_to_be_present_in_element((By.CSS_SELECTOR, css_selector), text),
+            timeout,
         )
 
-        record = CirculationRecord.objects.get()
-        self.book.refresh_from_db()
-        self.assertRedirects(response, reverse("circulation"))
-        self.assertEqual(self.book.available_copies, 0)
-        self.assertEqual(record.due_date, timezone.localdate() + timedelta(days=14))
-        self.assertFalse(record.returned)
+    def wait_for_value(self, css_selector, text, timeout=10):
+        """
+        Block until the value is found in the CSS selector.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as ec
 
-    def test_cannot_issue_book_when_no_copies_are_available(self):
-        self.book.available_copies = 0
-        self.book.save(update_fields=["available_copies"])
-
-        response = self.client.post(
-            reverse("circulation"),
-            {"book": self.book.pk, "member": self.member.pk},
+        self.wait_until(
+            ec.text_to_be_present_in_element_value(
+                (By.CSS_SELECTOR, css_selector), text
+            ),
+            timeout,
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(CirculationRecord.objects.exists())
-        self.assertContains(response, "This title has no available copies.")
-        self.book.refresh_from_db()
-        self.assertEqual(self.book.available_copies, 0)
+    def wait_until_visible(self, css_selector, timeout=10):
+        """
+        Block until the element described by the CSS selector is visible.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as ec
 
-    def test_return_restores_inventory_and_calculates_overdue_fine(self):
-        today = timezone.localdate()
-        record = CirculationRecord.objects.create(
-            book=self.book,
-            member=self.member,
-            issue_date=today - timedelta(days=20),
-            due_date=today - timedelta(days=6),
+        self.wait_until(
+            ec.visibility_of_element_located((By.CSS_SELECTOR, css_selector)), timeout
         )
-        self.book.available_copies = 0
-        self.book.save(update_fields=["available_copies"])
 
-        response = self.client.post(reverse("return_book", args=[record.pk]))
+    def wait_until_invisible(self, css_selector, timeout=10):
+        """
+        Block until the element described by the CSS selector is invisible.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as ec
 
-        record.refresh_from_db()
-        self.book.refresh_from_db()
-        self.assertRedirects(response, reverse("circulation"))
-        self.assertTrue(record.returned)
-        self.assertEqual(record.return_date, today)
-        self.assertEqual(record.fine_amount, Decimal("30.00"))
-        self.assertEqual(self.book.available_copies, 1)
-
-    def test_returned_record_cannot_be_processed_twice(self):
-        today = timezone.localdate()
-        record = CirculationRecord.objects.create(
-            book=self.book,
-            member=self.member,
-            issue_date=today - timedelta(days=15),
-            due_date=today - timedelta(days=1),
-            return_date=today,
-            returned=True,
+        self.wait_until(
+            ec.invisibility_of_element_located((By.CSS_SELECTOR, css_selector)), timeout
         )
-        self.book.available_copies = 0
-        self.book.save(update_fields=["available_copies"])
 
-        self.client.post(reverse("return_book", args=[record.pk]))
-
-        self.book.refresh_from_db()
-        self.assertEqual(self.book.available_copies, 0)
-
-    def test_return_on_or_before_due_date_has_no_fine(self):
-        today = timezone.localdate()
-        record = CirculationRecord.objects.create(
-            book=self.book,
-            member=self.member,
-            issue_date=today - timedelta(days=14),
-            due_date=today,
+    def wait_page_ready(self, timeout=10):
+        """
+        Block until the  page is ready.
+        """
+        self.wait_until(
+            lambda driver: driver.execute_script("return document.readyState;")
+            == "complete",
+            timeout,
         )
-        self.book.available_copies = 0
-        self.book.save(update_fields=["available_copies"])
 
-        self.client.post(reverse("return_book", args=[record.pk]))
+    @contextmanager
+    def wait_page_loaded(self, timeout=10):
+        """
+        Block until a new page has loaded and is ready.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as ec
 
-        record.refresh_from_db()
-        self.assertEqual(record.fine_amount, Decimal("0.00"))
+        old_page = self.selenium.find_element(By.TAG_NAME, "html")
+        yield
+        # Wait for the next page to be loaded
+        self.wait_until(ec.staleness_of(old_page), timeout=timeout)
+        self.wait_page_ready(timeout=timeout)
 
-    def test_catalog_searches_by_author_genre_and_isbn(self):
-        for query in ("Test Author", "Fiction", "9781234567890"):
-            with self.subTest(query=query):
-                response = self.client.get(reverse("catalog"), {"q": query})
-                self.assertContains(response, "Test Book")
+    def admin_login(self, username, password, login_url="/admin/"):
+        """
+        Log in to the admin.
+        """
+        from selenium.webdriver.common.by import By
 
+        self.selenium.get("%s%s" % (self.live_server_url, login_url))
+        username_input = self.selenium.find_element(By.NAME, "username")
+        username_input.send_keys(username)
+        password_input = self.selenium.find_element(By.NAME, "password")
+        password_input.send_keys(password)
+        login_text = _("Log in")
+        with self.wait_page_loaded():
+            self.selenium.find_element(
+                By.XPATH, '//input[@value="%s"]' % login_text
+            ).click()
 
-class AccessControlTests(TestCase):
-    def test_non_staff_cannot_open_circulation(self):
-        user = get_user_model().objects.create_user(
-            username="member", password="test-password"
+    def select_option(self, selector, value):
+        """
+        Select the <OPTION> with the value `value` inside the <SELECT> widget
+        identified by the CSS selector `selector`.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import Select
+
+        select = Select(self.selenium.find_element(By.CSS_SELECTOR, selector))
+        select.select_by_value(value)
+
+    def deselect_option(self, selector, value):
+        """
+        Deselect the <OPTION> with the value `value` inside the <SELECT> widget
+        identified by the CSS selector `selector`.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import Select
+
+        select = Select(self.selenium.find_element(By.CSS_SELECTOR, selector))
+        select.deselect_by_value(value)
+
+    def assertCountSeleniumElements(self, selector, count, root_element=None):
+        """
+        Assert number of matches for a CSS selector.
+
+        `root_element` allow restriction to a pre-selected node.
+        """
+        from selenium.webdriver.common.by import By
+
+        root_element = root_element or self.selenium
+        self.assertEqual(
+            len(root_element.find_elements(By.CSS_SELECTOR, selector)), count
         )
-        self.client.force_login(user)
-        response = self.client.get(reverse("circulation"))
 
-        self.assertEqual(response.status_code, 302)
-        self.assertIn(reverse("login"), response.url)
+    def _assertOptionsValues(self, options_selector, values):
+        from selenium.webdriver.common.by import By
 
-    def test_member_dashboard_requires_authentication(self):
-        response = self.client.get(reverse("member_dashboard"))
+        if values:
+            options = self.selenium.find_elements(By.CSS_SELECTOR, options_selector)
+            actual_values = []
+            for option in options:
+                actual_values.append(option.get_attribute("value"))
+            self.assertEqual(values, actual_values)
+        else:
+            # Prevent the `find_elements(By.CSS_SELECTOR, …)` call from blocking
+            # if the selector doesn't match any options as we expect it
+            # to be the case.
+            with self.disable_implicit_wait():
+                self.wait_until(
+                    lambda driver: not driver.find_elements(
+                        By.CSS_SELECTOR, options_selector
+                    )
+                )
 
-        self.assertEqual(response.status_code, 302)
-        self.assertIn(reverse("login"), response.url)
+    def assertSelectOptions(self, selector, values):
+        """
+        Assert that the <SELECT> widget identified by `selector` has the
+        options with the given `values`.
+        """
+        self._assertOptionsValues("%s > option" % selector, values)
 
-    def test_member_dashboard_only_shows_the_signed_in_members_history(self):
-        user = get_user_model().objects.create_user(
-            username="member", password="test-password"
+    def assertSelectedOptions(self, selector, values):
+        """
+        Assert that the <SELECT> widget identified by `selector` has the
+        selected options with the given `values`.
+        """
+        self._assertOptionsValues("%s > option:checked" % selector, values)
+
+    def is_disabled(self, selector):
+        """
+        Return True if the element identified by `selector` has the `disabled`
+        attribute.
+        """
+        from selenium.webdriver.common.by import By
+
+        return (
+            self.selenium.find_element(By.CSS_SELECTOR, selector).get_attribute(
+                "disabled"
+            )
+            == "true"
         )
-        author = Author.objects.create(name="History Author")
-        book = Book.objects.create(
-            title="Private Member Book",
-            author=author,
-            isbn="9781234567800",
-            genre="Fiction",
-            total_copies=1,
-            available_copies=0,
-        )
-        member = Member.objects.create(
-            name="Signed-in Member",
-            member_id="MEM-2",
-            email="member2@example.com",
-            user=user,
-        )
-        CirculationRecord.objects.create(book=book, member=member)
-        self.client.force_login(user)
-
-        response = self.client.get(reverse("member_dashboard"))
-
-        self.assertContains(response, "Private Member Book")
-        self.assertNotContains(response, "Test Book")

@@ -1,268 +1,624 @@
-"Misc. utility functions/classes for admin documentation generator."
+import datetime
+import decimal
+import json
+from collections import defaultdict
+from functools import reduce
+from operator import or_
 
-import re
-from email.errors import HeaderParseError
-from email.parser import HeaderParser
-from inspect import cleandoc
-
-from django.urls import reverse
+from django.core.exceptions import FieldDoesNotExist, ValidationError
+from django.core.validators import EMPTY_VALUES, URLValidator
+from django.db import models, router
+from django.db.models.constants import LOOKUP_SEP
+from django.db.models.deletion import Collector
+from django.forms.utils import pretty_name
+from django.urls import NoReverseMatch, reverse
+from django.utils import formats, timezone
+from django.utils.hashable import make_hashable
+from django.utils.html import format_html
 from django.utils.regex_helper import _lazy_re_compile
-from django.utils.safestring import mark_safe
+from django.utils.text import capfirst
+from django.utils.translation import ngettext
+from django.utils.translation import override as translation_override
 
-try:
-    import docutils.core
-    import docutils.nodes
-    import docutils.parsers.rst.roles
-    import docutils.writers
-except ImportError:
-    docutils_is_available = False
-else:
-    docutils_is_available = True
+QUOTE_MAP = {i: "_%02X" % i for i in b'":/_#?;@&=+$,"[]<>%\n\\'}
+UNQUOTE_MAP = {v: chr(k) for k, v in QUOTE_MAP.items()}
+UNQUOTE_RE = _lazy_re_compile("_(?:%s)" % "|".join([x[1:] for x in UNQUOTE_MAP]))
 
 
-def get_view_name(view_func):
-    if hasattr(view_func, "view_class"):
-        klass = view_func.view_class
-        return f"{klass.__module__}.{klass.__qualname__}"
-    mod_name = view_func.__module__
-    view_name = getattr(view_func, "__qualname__", view_func.__class__.__name__)
-    return mod_name + "." + view_name
+class FieldIsAForeignKeyColumnName(Exception):
+    """A field is a foreign key attname, i.e. <FK>_id."""
+
+    pass
 
 
-def parse_docstring(docstring):
+def lookup_spawns_duplicates(opts, lookup_path):
     """
-    Parse out the parts of a docstring.  Return (title, body, metadata).
+    Return True if the given lookup path spawns duplicates.
     """
-    if not docstring:
-        return "", "", {}
-    docstring = cleandoc(docstring)
-    parts = re.split(r"\n{2,}", docstring)
-    title = parts[0]
-    if len(parts) == 1:
-        body = ""
-        metadata = {}
-    else:
-        parser = HeaderParser()
+    lookup_fields = lookup_path.split(LOOKUP_SEP)
+    # Go through the fields (following all relations) and look for an m2m.
+    for field_name in lookup_fields:
+        if field_name == "pk":
+            field_name = opts.pk.name
         try:
-            metadata = parser.parsestr(parts[-1])
-        except HeaderParseError:
-            metadata = {}
-            body = "\n\n".join(parts[1:])
+            field = opts.get_field(field_name)
+        except FieldDoesNotExist:
+            # Ignore query lookups.
+            continue
         else:
-            metadata = dict(metadata.items())
-            if metadata:
-                body = "\n\n".join(parts[1:-1])
-            else:
-                body = "\n\n".join(parts[1:])
-    return title, body, metadata
+            if hasattr(field, "path_infos"):
+                # This field is a relation; update opts to follow the relation.
+                path_info = field.path_infos
+                opts = path_info[-1].to_opts
+                if any(path.m2m for path in path_info):
+                    # This field is a m2m relation so duplicates must be
+                    # handled.
+                    return True
+    return False
 
 
-def parse_rst(text, default_reference_context, thing_being_parsed=None):
+def get_last_value_from_parameters(parameters, key):
+    value = parameters.get(key)
+    return value[-1] if isinstance(value, list) else value
+
+
+def prepare_lookup_value(key, value, separator=","):
     """
-    Convert the string from reST to an XHTML fragment.
+    Return a lookup value prepared to be used in queryset filtering.
     """
-    overrides = {
-        "doctitle_xform": True,
-        "initial_header_level": 3,
-        "default_reference_context": default_reference_context,
-        "link_base": reverse("django-admindocs-docroot").rstrip("/"),
-        "raw_enabled": False,
-        "file_insertion_enabled": False,
-    }
-    thing_being_parsed = thing_being_parsed and "<%s>" % thing_being_parsed
-    # Wrap ``text`` in some reST that sets the default role to ``cmsreference``,
-    # then restores it.
-    source = """
-.. default-role:: cmsreference
-
-%s
-
-.. default-role::
-"""
-    # In docutils < 0.22, the `writer` param must be an instance. Passing a
-    # string writer name like "html" is only supported in 0.22+.
-    writer_instance = docutils.writers.get_writer_class("html")()
-    parts = docutils.core.publish_parts(
-        source % text,
-        source_path=thing_being_parsed,
-        destination_path=None,
-        writer=writer_instance,
-        settings_overrides=overrides,
-    )
-    return mark_safe(parts["fragment"])
+    if isinstance(value, list):
+        return [prepare_lookup_value(key, v, separator=separator) for v in value]
+    # if key ends with __in, split parameter into separate values
+    if key.endswith("__in"):
+        value = value.split(separator)
+    # if key ends with __isnull, special case '' and the string literals 'false' and '0'
+    elif key.endswith("__isnull"):
+        value = value.lower() not in ("", "false", "0")
+    return value
 
 
-#
-# reST roles
-#
-ROLES = {
-    "model": "%s/models/%s/",
-    "view": "%s/views/%s/",
-    "template": "%s/templates/%s/",
-    "filter": "%s/filters/#%s",
-    "tag": "%s/tags/#%s",
-}
-
-explicit_title_re = re.compile(r"^(.+?)\s*(?<!\x00)<([^<]*?)>$", re.DOTALL)
+def build_q_object_from_lookup_parameters(parameters):
+    q_object = models.Q()
+    for param, param_item_list in parameters.items():
+        q_object &= reduce(or_, (models.Q((param, item)) for item in param_item_list))
+    return q_object
 
 
-def split_explicit_title(text):
+def quote(s):
     """
-    Split role content into title and target, if given.
-
-    From sphinx.util.nodes.split_explicit_title
-    See https://github.com/sphinx-doc/sphinx/blob/230ccf2/sphinx/util/nodes.py#L389
+    Ensure that primary key values do not confuse the admin URLs by escaping
+    any '/', '_' and ':' and similarly problematic characters.
+    Similar to urllib.parse.quote(), except that the quoting is slightly
+    different so that it doesn't get automatically unquoted by the web browser.
     """
-    match = explicit_title_re.match(text)
-    if match:
-        return True, match.group(1), match.group(2)
-    return False, text, text
+    return s.translate(QUOTE_MAP) if isinstance(s, str) else s
 
 
-def create_reference_role(rolename, urlbase):
-    # Views and template names are case-sensitive.
-    is_case_sensitive = rolename in ["template", "view"]
+def unquote(s):
+    """Undo the effects of quote()."""
+    return UNQUOTE_RE.sub(lambda m: UNQUOTE_MAP[m[0]], s)
 
-    def _role(name, rawtext, text, lineno, inliner, options=None, content=None):
-        if options is None:
-            options = {}
-        _, title, target = split_explicit_title(text)
-        node = docutils.nodes.reference(
-            rawtext,
-            title,
-            refuri=(
-                urlbase
-                % (
-                    inliner.document.settings.link_base,
-                    target if is_case_sensitive else target.lower(),
+
+def flatten(fields):
+    """
+    Return a list which is a single level of flattening of the original list.
+    """
+    flat = []
+    for field in fields:
+        if isinstance(field, (list, tuple)):
+            flat.extend(field)
+        else:
+            flat.append(field)
+    return flat
+
+
+def flatten_fieldsets(fieldsets):
+    """Return a list of field names from an admin fieldsets structure."""
+    field_names = []
+    for name, opts in fieldsets:
+        field_names.extend(flatten(opts["fields"]))
+    return field_names
+
+
+def get_deleted_objects(objs, request, admin_site):
+    """
+    Find all objects related to ``objs`` that should also be deleted. ``objs``
+    must be a homogeneous iterable of objects (e.g. a QuerySet).
+
+    Return a nested list of strings suitable for display in the
+    template with the ``unordered_list`` filter.
+    """
+    try:
+        obj = objs[0]
+    except IndexError:
+        return [], {}, set(), []
+    else:
+        using = router.db_for_write(obj._meta.model)
+    collector = NestedObjects(using=using, origin=objs)
+    collector.collect(objs)
+    perms_needed = set()
+
+    def format_callback(obj):
+        model = obj.__class__
+        opts = obj._meta
+
+        no_edit_link = "%s: %s" % (capfirst(opts.verbose_name), obj)
+
+        if admin_site.is_registered(model):
+            if not admin_site.get_model_admin(model).has_delete_permission(
+                request, obj
+            ):
+                perms_needed.add(opts.verbose_name)
+            try:
+                admin_url = reverse(
+                    "%s:%s_%s_change"
+                    % (admin_site.name, opts.app_label, opts.model_name),
+                    None,
+                    (quote(obj.pk),),
                 )
-            ),
-            **options,
-        )
-        return [node], []
+            except NoReverseMatch:
+                # Change url doesn't exist -- don't display link to edit
+                return no_edit_link
 
-    docutils.parsers.rst.roles.register_canonical_role(rolename, _role)
-
-
-def default_reference_role(
-    name, rawtext, text, lineno, inliner, options=None, content=None
-):
-    if options is None:
-        options = {}
-    context = inliner.document.settings.default_reference_context
-    node = docutils.nodes.reference(
-        rawtext,
-        text,
-        refuri=(
-            ROLES[context]
-            % (
-                inliner.document.settings.link_base,
-                text.lower(),
+            # Display a link to the admin page.
+            return format_html(
+                '{}: <a href="{}">{}</a>', capfirst(opts.verbose_name), admin_url, obj
             )
-        ),
-        **options,
-    )
-    return [node], []
+        else:
+            # Don't display link to edit, because it either has no
+            # admin or is edited inline.
+            return no_edit_link
+
+    to_delete = collector.nested(format_callback)
+
+    protected = [format_callback(obj) for obj in collector.protected]
+    model_count = {
+        model._meta.verbose_name_plural: len(objs)
+        for model, objs in collector.model_objs.items()
+    }
+
+    return to_delete, model_count, perms_needed, protected
 
 
-if docutils_is_available:
-    docutils.parsers.rst.roles.register_canonical_role(
-        "cmsreference", default_reference_role
-    )
+class NestedObjects(Collector):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.edges = {}  # {from_instance: [to_instances]}
+        self.protected = set()
+        self.model_objs = defaultdict(set)
 
-    for name, urlbase in ROLES.items():
-        create_reference_role(name, urlbase)
+    def add_edge(self, source, target):
+        self.edges.setdefault(source, []).append(target)
 
-# Match the beginning of a named, unnamed, or non-capturing groups.
-named_group_matcher = _lazy_re_compile(r"\(\?P(<\w+>)")
-unnamed_group_matcher = _lazy_re_compile(r"\(")
-non_capturing_group_matcher = _lazy_re_compile(r"\(\?\:")
+    def collect(self, objs, source=None, source_attr=None, **kwargs):
+        for obj in objs:
+            if source_attr and not source_attr.endswith("+"):
+                related_name = source_attr % {
+                    "class": source._meta.model_name,
+                    "app_label": source._meta.app_label,
+                }
+                self.add_edge(getattr(obj, related_name), obj)
+            else:
+                self.add_edge(None, obj)
+            self.model_objs[obj._meta.model].add(obj)
+        try:
+            return super().collect(objs, source_attr=source_attr, **kwargs)
+        except models.ProtectedError as e:
+            self.protected.update(e.protected_objects)
+        except models.RestrictedError as e:
+            self.protected.update(e.restricted_objects)
+
+    def related_objects(self, related_model, related_fields, objs):
+        qs = super().related_objects(related_model, related_fields, objs)
+        return qs.select_related(
+            *[related_field.name for related_field in related_fields]
+        )
+
+    def _nested(self, obj, seen, format_callback):
+        if obj in seen:
+            return []
+        seen.add(obj)
+        children = []
+        for child in self.edges.get(obj, ()):
+            children.extend(self._nested(child, seen, format_callback))
+        if format_callback:
+            ret = [format_callback(obj)]
+        else:
+            ret = [obj]
+        if children:
+            ret.append(children)
+        return ret
+
+    def nested(self, format_callback=None):
+        """
+        Return the graph as a nested list.
+        """
+        seen = set()
+        roots = []
+        for root in self.edges.get(None, ()):
+            roots.extend(self._nested(root, seen, format_callback))
+        return roots
+
+    def can_fast_delete(self, *args, **kwargs):
+        """
+        We always want to load the objects into memory so that we can display
+        them to the user in confirm page.
+        """
+        return False
 
 
-def replace_metacharacters(pattern):
-    """Remove unescaped metacharacters from the pattern."""
-    return re.sub(
-        r"((?:^|(?<!\\))(?:\\\\)*)(\\?)([?*+^$]|\\[bBAZ])",
-        lambda m: m[1] + m[3] if m[2] else m[1],
-        pattern,
-    )
-
-
-def _get_group_start_end(start, end, pattern):
-    # Handle nested parentheses, e.g. '^(?P<a>(x|y))/b' or '^b/((x|y)\w+)$'.
-    unmatched_open_brackets, prev_char = 1, None
-    for idx, val in enumerate(pattern[end:]):
-        # Check for unescaped `(` and `)`. They mark the start and end of a
-        # nested group.
-        if val == "(" and prev_char != "\\":
-            unmatched_open_brackets += 1
-        elif val == ")" and prev_char != "\\":
-            unmatched_open_brackets -= 1
-        prev_char = val
-        # If brackets are balanced, the end of the string for the current named
-        # capture group pattern has been reached.
-        if unmatched_open_brackets == 0:
-            return start, end + idx + 1
-
-
-def _find_groups(pattern, group_matcher):
-    prev_end = None
-    for match in group_matcher.finditer(pattern):
-        if indices := _get_group_start_end(match.start(0), match.end(0), pattern):
-            start, end = indices
-            if prev_end and start > prev_end or not prev_end:
-                yield start, end, match
-            prev_end = end
-
-
-def replace_named_groups(pattern):
-    r"""
-    Find named groups in `pattern` and replace them with the group name. E.g.,
-    1. ^(?P<a>\w+)/b/(\w+)$ ==> ^<a>/b/(\w+)$
-    2. ^(?P<a>\w+)/b/(?P<c>\w+)/$ ==> ^<a>/b/<c>/$
-    3. ^(?P<a>\w+)/b/(\w+) ==> ^<a>/b/(\w+)
-    4. ^(?P<a>\w+)/b/(?P<c>\w+) ==> ^<a>/b/<c>
+def model_format_dict(obj):
     """
-    group_pattern_and_name = [
-        (pattern[start:end], match[1])
-        for start, end, match in _find_groups(pattern, named_group_matcher)
+    Return a `dict` with keys 'verbose_name' and 'verbose_name_plural',
+    typically for use with string formatting.
+
+    `obj` may be a `Model` instance, `Model` subclass, or `QuerySet` instance.
+    """
+    if isinstance(obj, (models.Model, models.base.ModelBase)):
+        opts = obj._meta
+    elif isinstance(obj, models.query.QuerySet):
+        opts = obj.model._meta
+    else:
+        opts = obj
+    return {
+        "verbose_name": opts.verbose_name,
+        "verbose_name_plural": opts.verbose_name_plural,
+    }
+
+
+def model_ngettext(obj, n=None):
+    """
+    Return the appropriate `verbose_name` or `verbose_name_plural` value for
+    `obj` depending on the count `n`.
+
+    `obj` may be a `Model` instance, `Model` subclass, or `QuerySet` instance.
+    If `obj` is a `QuerySet` instance, `n` is optional and the length of the
+    `QuerySet` is used.
+    """
+    if isinstance(obj, models.query.QuerySet):
+        if n is None:
+            n = obj.count()
+        obj = obj.model
+    d = model_format_dict(obj)
+    singular, plural = d["verbose_name"], d["verbose_name_plural"]
+    return ngettext(singular, plural, n or 0)
+
+
+def lookup_field(name, obj, model_admin=None):
+    opts = obj._meta
+    try:
+        f = _get_non_gfk_field(opts, name)
+    except (FieldDoesNotExist, FieldIsAForeignKeyColumnName):
+        # For non-regular field values, the value is either a method,
+        # property, related field, or returned via a callable.
+        if callable(name):
+            attr = name
+            value = attr(obj)
+        elif hasattr(model_admin, name) and name != "__str__":
+            attr = getattr(model_admin, name)
+            value = attr(obj)
+        else:
+            sentinel = object()
+            attr = getattr(obj, name, sentinel)
+            if callable(attr):
+                value = attr()
+            else:
+                if attr is sentinel:
+                    attr = obj
+                    for part in name.split(LOOKUP_SEP):
+                        attr = getattr(attr, part, sentinel)
+                        if attr is sentinel:
+                            return None, None, None
+                value = attr
+            if hasattr(model_admin, "model") and hasattr(model_admin.model, name):
+                attr = getattr(model_admin.model, name)
+        f = None
+    else:
+        attr = None
+        value = getattr(obj, name)
+    return f, attr, value
+
+
+def _get_non_gfk_field(opts, name):
+    """
+    For historical reasons, the admin app relies on GenericForeignKeys as being
+    "not found" by get_field(). This could likely be cleaned up.
+
+    Reverse relations should also be excluded as these aren't attributes of the
+    model (rather something like `foo_set`).
+    """
+    field = opts.get_field(name)
+    if (
+        field.is_relation
+        and
+        # Generic foreign keys OR reverse relations
+        ((field.many_to_one and not field.related_model) or field.one_to_many)
+    ):
+        raise FieldDoesNotExist()
+
+    # Avoid coercing <FK>_id fields to FK
+    if (
+        field.is_relation
+        and not field.many_to_many
+        and hasattr(field, "attname")
+        and field.attname == name
+    ):
+        raise FieldIsAForeignKeyColumnName()
+
+    return field
+
+
+def label_for_field(name, model, model_admin=None, return_attr=False, form=None):
+    """
+    Return a sensible label for a field name. The name can be a callable,
+    property (but not created with @property decorator), or the name of an
+    object's attribute, as well as a model field, including across related
+    objects. If return_attr is True, also return the resolved attribute
+    (which could be a callable). This will be None if (and only if) the name
+    refers to a field.
+    """
+    attr = None
+    try:
+        field = _get_non_gfk_field(model._meta, name)
+        try:
+            label = field.verbose_name
+        except AttributeError:
+            # field is likely a ForeignObjectRel
+            label = field.related_model._meta.verbose_name
+    except FieldDoesNotExist:
+        if name == "__str__":
+            label = str(model._meta.verbose_name)
+            attr = str
+        else:
+            if callable(name):
+                attr = name
+            elif hasattr(model_admin, name):
+                attr = getattr(model_admin, name)
+            elif hasattr(model, name):
+                attr = getattr(model, name)
+            elif form and name in form.fields:
+                attr = form.fields[name]
+            else:
+                try:
+                    attr = get_fields_from_path(model, name)[-1]
+                except (FieldDoesNotExist, NotRelationField):
+                    message = f"Unable to lookup '{name}' on {model._meta.object_name}"
+                    if model_admin:
+                        message += f" or {model_admin.__class__.__name__}"
+                    if form:
+                        message += f" or {form.__class__.__name__}"
+                    raise AttributeError(message)
+
+            if hasattr(attr, "short_description"):
+                label = attr.short_description
+            elif (
+                isinstance(attr, property)
+                and hasattr(attr, "fget")
+                and hasattr(attr.fget, "short_description")
+            ):
+                label = attr.fget.short_description
+            elif callable(attr):
+                if attr.__name__ == "<lambda>":
+                    label = "--"
+                else:
+                    label = pretty_name(attr.__name__)
+            else:
+                label = pretty_name(name)
+    except FieldIsAForeignKeyColumnName:
+        label = pretty_name(name)
+        attr = name
+
+    if return_attr:
+        return (label, attr)
+    else:
+        return label
+
+
+def help_text_for_field(name, model):
+    help_text = ""
+    try:
+        field = _get_non_gfk_field(model._meta, name)
+    except (FieldDoesNotExist, FieldIsAForeignKeyColumnName):
+        pass
+    else:
+        if hasattr(field, "help_text"):
+            help_text = field.help_text
+    return help_text
+
+
+def display_for_field(value, field, empty_value_display, avoid_link=False):
+    from django.contrib.admin.templatetags.admin_list import _boolean_icon
+
+    if getattr(field, "flatchoices", None):
+        try:
+            return dict(field.flatchoices).get(value, empty_value_display)
+        except TypeError:
+            # Allow list-like choices.
+            flatchoices = make_hashable(field.flatchoices)
+            value = make_hashable(value)
+            return dict(flatchoices).get(value, empty_value_display)
+
+    # BooleanField needs special-case null-handling, so it comes before the
+    # general null test.
+    elif isinstance(field, models.BooleanField):
+        return _boolean_icon(value)
+    elif value in field.empty_values:
+        return empty_value_display
+    elif isinstance(field, models.DateTimeField):
+        return formats.localize(timezone.template_localtime(value))
+    elif isinstance(field, (models.DateField, models.TimeField)):
+        return formats.localize(value)
+    elif isinstance(field, models.DecimalField):
+        return formats.number_format(value, field.decimal_places)
+    elif isinstance(field, (models.IntegerField, models.FloatField)):
+        return formats.number_format(value)
+    elif isinstance(field, models.FileField) and value and not avoid_link:
+        return format_html('<a href="{}">{}</a>', value.url, value)
+    elif isinstance(field, models.URLField) and value and not avoid_link:
+        # Only render a clickable link for URLs with a safe scheme, so that a
+        # potentially dangerous stored value is shown as plain text rather than
+        # an executable link. The check is deliberately independent of the
+        # field's own validators, which may permit such schemes.
+        try:
+            URLValidator()(value)
+        except ValidationError:
+            return display_for_value(value, empty_value_display)
+        return format_html('<a href="{}">{}</a>', value, value)
+    elif isinstance(field, models.JSONField) and value:
+        try:
+            return json.dumps(value, ensure_ascii=False, cls=field.encoder)
+        except TypeError:
+            return display_for_value(value, empty_value_display)
+    else:
+        return display_for_value(value, empty_value_display)
+
+
+def display_for_value(value, empty_value_display, boolean=False):
+    from django.contrib.admin.templatetags.admin_list import _boolean_icon
+
+    if boolean:
+        return _boolean_icon(value)
+    elif value in EMPTY_VALUES:
+        return empty_value_display
+    elif isinstance(value, bool):
+        return str(value)
+    elif isinstance(value, datetime.datetime):
+        return formats.localize(timezone.template_localtime(value))
+    elif isinstance(value, (datetime.date, datetime.time)):
+        return formats.localize(value)
+    elif isinstance(value, (int, decimal.Decimal, float)):
+        return formats.number_format(value)
+    elif isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    else:
+        return str(value)
+
+
+class NotRelationField(Exception):
+    pass
+
+
+def get_model_from_relation(field):
+    if hasattr(field, "path_infos"):
+        return field.path_infos[-1].to_opts.model
+    else:
+        raise NotRelationField
+
+
+def reverse_field_path(model, path):
+    """Create a reversed field path.
+
+    E.g. Given (Order, "user__groups"),
+    return (Group, "user__order").
+
+    Final field must be a related model, not a data field.
+    """
+    reversed_path = []
+    parent = model
+    pieces = path.split(LOOKUP_SEP)
+    for piece in pieces:
+        field = parent._meta.get_field(piece)
+        # skip trailing data field if extant:
+        if len(reversed_path) == len(pieces) - 1:  # final iteration
+            try:
+                get_model_from_relation(field)
+            except NotRelationField:
+                break
+
+        # Field should point to another model
+        if field.is_relation and not (field.auto_created and not field.concrete):
+            related_name = field.related_query_name()
+            parent = field.remote_field.model
+        else:
+            related_name = field.field.name
+            parent = field.related_model
+        reversed_path.insert(0, related_name)
+    return (parent, LOOKUP_SEP.join(reversed_path))
+
+
+def get_fields_from_path(model, path):
+    """Return list of Fields given path relative to model.
+
+    e.g. (ModelX, "user__groups__name") -> [
+        <django.db.models.fields.related.ForeignKey object at 0x...>,
+        <django.db.models.fields.related.ManyToManyField object at 0x...>,
+        <django.db.models.fields.CharField object at 0x...>,
     ]
-    for group_pattern, group_name in group_pattern_and_name:
-        pattern = pattern.replace(group_pattern, group_name)
-    return pattern
-
-
-def replace_unnamed_groups(pattern):
-    r"""
-    Find unnamed groups in `pattern` and replace them with '<var>'. E.g.,
-    1. ^(?P<a>\w+)/b/(\w+)$ ==> ^(?P<a>\w+)/b/<var>$
-    2. ^(?P<a>\w+)/b/((x|y)\w+)$ ==> ^(?P<a>\w+)/b/<var>$
-    3. ^(?P<a>\w+)/b/(\w+) ==> ^(?P<a>\w+)/b/<var>
-    4. ^(?P<a>\w+)/b/((x|y)\w+) ==> ^(?P<a>\w+)/b/<var>
     """
-    final_pattern, prev_end = "", None
-    for start, end, _ in _find_groups(pattern, unnamed_group_matcher):
-        if prev_end:
-            final_pattern += pattern[prev_end:start]
-        final_pattern += pattern[:start] + "<var>"
-        prev_end = end
-    return final_pattern + pattern[prev_end:]
+    pieces = path.split(LOOKUP_SEP)
+    fields = []
+    for piece in pieces:
+        if fields:
+            parent = get_model_from_relation(fields[-1])
+        else:
+            parent = model
+        fields.append(parent._meta.get_field(piece))
+    return fields
 
 
-def remove_non_capturing_groups(pattern):
-    r"""
-    Find non-capturing groups in the given `pattern` and remove them, e.g.
-    1. (?P<a>\w+)/b/(?:\w+)c(?:\w+) => (?P<a>\\w+)/b/c
-    2. ^(?:\w+(?:\w+))a => ^a
-    3. ^a(?:\w+)/b(?:\w+) => ^a/b
+def construct_change_message(form, formsets, add):
     """
-    group_start_end_indices = _find_groups(pattern, non_capturing_group_matcher)
-    final_pattern, prev_end = "", None
-    for start, end, _ in group_start_end_indices:
-        final_pattern += pattern[prev_end:start]
-        prev_end = end
-    return final_pattern + pattern[prev_end:]
+    Construct a JSON structure describing changes from a changed object.
+    Translations are deactivated so that strings are stored untranslated.
+    Translation happens later on LogEntry access.
+    """
+    # Evaluating `form.changed_data` prior to disabling translations is required
+    # to avoid fields affected by localization from being included incorrectly,
+    # e.g. where date formats differ such as MM/DD/YYYY vs DD/MM/YYYY.
+    changed_data = form.changed_data
+    with translation_override(None):
+        # Deactivate translations while fetching verbose_name for form
+        # field labels and using `field_name`, if verbose_name is not provided.
+        # Translations will happen later on LogEntry access.
+        changed_field_labels = _get_changed_field_labels_from_form(form, changed_data)
+
+    change_message = []
+    if add:
+        change_message.append({"added": {}})
+    elif form.changed_data:
+        change_message.append({"changed": {"fields": changed_field_labels}})
+    if formsets:
+        with translation_override(None):
+            for formset in formsets:
+                for added_object in formset.new_objects:
+                    change_message.append(
+                        {
+                            "added": {
+                                "name": str(added_object._meta.verbose_name),
+                                "object": str(added_object),
+                            }
+                        }
+                    )
+                for changed_object, changed_fields in formset.changed_objects:
+                    change_message.append(
+                        {
+                            "changed": {
+                                "name": str(changed_object._meta.verbose_name),
+                                "object": str(changed_object),
+                                "fields": _get_changed_field_labels_from_form(
+                                    formset.forms[0], changed_fields
+                                ),
+                            }
+                        }
+                    )
+                for deleted_object in formset.deleted_objects:
+                    change_message.append(
+                        {
+                            "deleted": {
+                                "name": str(deleted_object._meta.verbose_name),
+                                "object": str(deleted_object),
+                            }
+                        }
+                    )
+    return change_message
 
 
-def strip_p_tags(value):
-    return mark_safe(value.replace("<p>", "").replace("</p>", ""))
+def _get_changed_field_labels_from_form(form, changed_data):
+    changed_field_labels = []
+    for field_name in changed_data:
+        try:
+            verbose_field_name = form.fields[field_name].label or field_name
+        except KeyError:
+            verbose_field_name = field_name
+        changed_field_labels.append(str(verbose_field_name))
+    return changed_field_labels

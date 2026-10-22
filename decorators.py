@@ -1,229 +1,135 @@
-"Functions that help with dynamically creating decorators for views."
+from functools import wraps
+from urllib.parse import urlsplit
 
-from functools import partial, update_wrapper, wraps
+from asgiref.sync import async_to_sync, iscoroutinefunction, sync_to_async
 
-from asgiref.sync import iscoroutinefunction, markcoroutinefunction
-
-
-class classonlymethod(classmethod):
-    def __get__(self, instance, cls=None):
-        if instance is not None:
-            raise AttributeError(
-                "This method is available only on the class, not on instances."
-            )
-        return super().__get__(instance, cls)
+from django.conf import settings
+from django.contrib.auth import REDIRECT_FIELD_NAME
+from django.core.exceptions import PermissionDenied
+from django.shortcuts import resolve_url
 
 
-def _update_method_wrapper(_wrapper, decorator):
-    # _multi_decorate()'s bound_method isn't available in this scope. Cheat by
-    # using it on a dummy function.
-    @decorator
-    def dummy(*args, **kwargs):
-        pass
-
-    update_wrapper(_wrapper, dummy)
-
-
-def _multi_decorate(decorators, method):
+def user_passes_test(
+    test_func, login_url=None, redirect_field_name=REDIRECT_FIELD_NAME
+):
     """
-    Decorate `method` with one or more function decorators. `decorators` can be
-    a single decorator or an iterable of decorators.
-    """
-    if hasattr(decorators, "__iter__"):
-        # Apply a list/tuple of decorators if 'decorators' is one. Decorator
-        # functions are applied so that the call order is the same as the
-        # order in which they appear in the iterable.
-        decorators = decorators[::-1]
-    else:
-        decorators = [decorators]
-
-    def _wrapper(self, *args, **kwargs):
-        # bound_method has the signature that 'decorator' expects i.e. no
-        # 'self' argument, but it's a closure over self so it can call
-        # 'func'. Also, wrap method.__get__() in a function because new
-        # attributes can't be set on bound method objects, only on functions.
-        bound_method = wraps(method)(partial(method.__get__(self, type(self))))
-        for dec in decorators:
-            bound_method = dec(bound_method)
-        return bound_method(*args, **kwargs)
-
-    # Copy any attributes that a decorator adds to the function it decorates.
-    for dec in decorators:
-        _update_method_wrapper(_wrapper, dec)
-    # Preserve any existing attributes of 'method', including the name.
-    update_wrapper(_wrapper, method)
-
-    if iscoroutinefunction(method):
-        markcoroutinefunction(_wrapper)
-
-    return _wrapper
-
-
-def method_decorator(decorator, name=""):
-    """
-    Convert a function decorator into a method decorator
+    Decorator for views that checks that the user passes the given test,
+    redirecting to the log-in page if necessary. The test should be a callable
+    that takes the user object and returns True if the user passes.
     """
 
-    # 'obj' can be a class or a function. If 'obj' is a function at the time it
-    # is passed to _dec,  it will eventually be a method of the class it is
-    # defined on. If 'obj' is a class, the 'name' is required to be the name
-    # of the method that will be decorated.
-    def _dec(obj):
-        if not isinstance(obj, type):
-            return _multi_decorate(decorator, obj)
-        if not (name and hasattr(obj, name)):
-            raise ValueError(
-                "The keyword argument `name` must be the name of a method "
-                "of the decorated class: %s. Got '%s' instead." % (obj, name)
-            )
-        method = getattr(obj, name)
-        if not callable(method):
-            raise TypeError(
-                "Cannot decorate '%s' as it isn't a callable attribute of "
-                "%s (%s)." % (name, obj, method)
-            )
-        _wrapper = _multi_decorate(decorator, method)
-        setattr(obj, name, _wrapper)
-        return obj
+    def decorator(view_func):
+        def _redirect_to_login(request):
+            path = request.build_absolute_uri()
+            resolved_login_url = resolve_url(login_url or settings.LOGIN_URL)
+            # If the login url is the same scheme and net location then just
+            # use the path as the "next" url.
+            login_scheme, login_netloc = urlsplit(resolved_login_url)[:2]
+            current_scheme, current_netloc = urlsplit(path)[:2]
+            if (not login_scheme or login_scheme == current_scheme) and (
+                not login_netloc or login_netloc == current_netloc
+            ):
+                path = request.get_full_path()
+            from django.contrib.auth.views import redirect_to_login
 
-    # Don't worry about making _dec look similar to a list/tuple as it's rather
-    # meaningless.
-    if not hasattr(decorator, "__iter__"):
-        update_wrapper(_dec, decorator)
-    # Change the name to aid debugging.
-    obj = decorator if hasattr(decorator, "__name__") else decorator.__class__
-    _dec.__name__ = "method_decorator(%s)" % obj.__name__
-    return _dec
+            return redirect_to_login(path, resolved_login_url, redirect_field_name)
 
+        if iscoroutinefunction(view_func):
 
-def decorator_from_middleware_with_args(middleware_class):
-    """
-    Like decorator_from_middleware, but return a function
-    that accepts the arguments to be passed to the middleware_class.
-    Use like::
-
-         cache_page = decorator_from_middleware_with_args(CacheMiddleware)
-         # ...
-
-         @cache_page(3600)
-         def my_view(request):
-             # ...
-    """
-    return make_middleware_decorator(middleware_class)
-
-
-def decorator_from_middleware(middleware_class):
-    """
-    Given a middleware class (not an instance), return a view decorator. This
-    lets you use middleware functionality on a per-view basis. The middleware
-    is created with no params passed.
-    """
-    return make_middleware_decorator(middleware_class)()
-
-
-def make_middleware_decorator(middleware_class):
-    def _make_decorator(*m_args, **m_kwargs):
-        def _decorator(view_func):
-            middleware = middleware_class(view_func, *m_args, **m_kwargs)
-
-            def _pre_process_request(request, *args, **kwargs):
-                if hasattr(middleware, "process_request"):
-                    result = middleware.process_request(request)
-                    if result is not None:
-                        return result
-                if hasattr(middleware, "process_view"):
-                    result = middleware.process_view(request, view_func, args, kwargs)
-                    if result is not None:
-                        return result
-                return None
-
-            def _process_exception(request, exception):
-                if hasattr(middleware, "process_exception"):
-                    result = middleware.process_exception(request, exception)
-                    if result is not None:
-                        return result
-                raise
-
-            def _post_process_request(request, response):
-                if hasattr(response, "render") and callable(response.render):
-                    if hasattr(middleware, "process_template_response"):
-                        response = middleware.process_template_response(
-                            request, response
-                        )
-                    # Defer running of process_response until after the template
-                    # has been rendered:
-                    if hasattr(middleware, "process_response"):
-
-                        def callback(response):
-                            return middleware.process_response(request, response)
-
-                        response.add_post_render_callback(callback)
+            async def _view_wrapper(request, *args, **kwargs):
+                auser = await request.auser()
+                if iscoroutinefunction(test_func):
+                    test_pass = await test_func(auser)
                 else:
-                    if hasattr(middleware, "process_response"):
-                        return middleware.process_response(request, response)
-                return response
+                    test_pass = await sync_to_async(test_func)(auser)
 
-            if iscoroutinefunction(view_func):
+                if test_pass:
+                    return await view_func(request, *args, **kwargs)
+                return _redirect_to_login(request)
 
-                async def _view_wrapper(request, *args, **kwargs):
-                    result = _pre_process_request(request, *args, **kwargs)
-                    if result is not None:
-                        return result
+        else:
 
-                    try:
-                        response = await view_func(request, *args, **kwargs)
-                    except Exception as e:
-                        result = _process_exception(request, e)
-                        if result is not None:
-                            return result
+            def _view_wrapper(request, *args, **kwargs):
+                if iscoroutinefunction(test_func):
+                    test_pass = async_to_sync(test_func)(request.user)
+                else:
+                    test_pass = test_func(request.user)
 
-                    return _post_process_request(request, response)
+                if test_pass:
+                    return view_func(request, *args, **kwargs)
+                return _redirect_to_login(request)
 
-            else:
+        # Attributes used by LoginRequiredMiddleware.
+        _view_wrapper.login_url = login_url
+        _view_wrapper.redirect_field_name = redirect_field_name
 
-                def _view_wrapper(request, *args, **kwargs):
-                    result = _pre_process_request(request, *args, **kwargs)
-                    if result is not None:
-                        return result
+        return wraps(view_func)(_view_wrapper)
 
-                    try:
-                        response = view_func(request, *args, **kwargs)
-                    except Exception as e:
-                        result = _process_exception(request, e)
-                        if result is not None:
-                            return result
-
-                    return _post_process_request(request, response)
-
-            return wraps(view_func)(_view_wrapper)
-
-        return _decorator
-
-    return _make_decorator
+    return decorator
 
 
-def sync_and_async_middleware(func):
+def login_required(
+    function=None, redirect_field_name=REDIRECT_FIELD_NAME, login_url=None
+):
     """
-    Mark a middleware factory as returning a hybrid middleware supporting both
-    types of request.
+    Decorator for views that checks that the user is logged in, redirecting
+    to the log-in page if necessary.
     """
-    func.sync_capable = True
-    func.async_capable = True
-    return func
+    actual_decorator = user_passes_test(
+        lambda u: u.is_authenticated,
+        login_url=login_url,
+        redirect_field_name=redirect_field_name,
+    )
+    if function:
+        return actual_decorator(function)
+    return actual_decorator
 
 
-def sync_only_middleware(func):
+def login_not_required(view_func):
     """
-    Mark a middleware factory as returning a sync middleware.
-    This is the default.
+    Decorator for views that allows access to unauthenticated requests.
     """
-    func.sync_capable = True
-    func.async_capable = False
-    return func
+    view_func.login_required = False
+    return view_func
 
 
-def async_only_middleware(func):
-    """Mark a middleware factory as returning an async middleware."""
-    func.sync_capable = False
-    func.async_capable = True
-    return func
+def permission_required(perm, login_url=None, raise_exception=False):
+    """
+    Decorator for views that checks whether a user has a particular permission
+    enabled, redirecting to the log-in page if necessary.
+    If the raise_exception parameter is given the PermissionDenied exception
+    is raised.
+    """
+    if isinstance(perm, str):
+        perms = (perm,)
+    else:
+        perms = perm
+
+    def decorator(view_func):
+        if iscoroutinefunction(view_func):
+
+            async def check_perms(user):
+                # First check if the user has the permission (even anon users).
+                if await user.ahas_perms(perms):
+                    return True
+                # In case the 403 handler should be called raise the exception.
+                if raise_exception:
+                    raise PermissionDenied
+                # As the last resort, show the login form.
+                return False
+
+        else:
+
+            def check_perms(user):
+                # First check if the user has the permission (even anon users).
+                if user.has_perms(perms):
+                    return True
+                # In case the 403 handler should be called raise the exception.
+                if raise_exception:
+                    raise PermissionDenied
+                # As the last resort, show the login form.
+                return False
+
+        return user_passes_test(check_perms, login_url=login_url)(view_func)
+
+    return decorator

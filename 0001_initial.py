@@ -1,13 +1,14 @@
-import django.contrib.contenttypes.models
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-    dependencies = []
+    dependencies = [
+        ("sites", "0001_initial"),
+    ]
 
     operations = [
         migrations.CreateModel(
-            name="ContentType",
+            name="FlatPage",
             fields=[
                 (
                     "id",
@@ -18,28 +19,50 @@ class Migration(migrations.Migration):
                         primary_key=True,
                     ),
                 ),
-                ("name", models.CharField(max_length=100)),
-                ("app_label", models.CharField(max_length=100)),
                 (
-                    "model",
+                    "url",
+                    models.CharField(max_length=100, verbose_name="URL", db_index=True),
+                ),
+                ("title", models.CharField(max_length=200, verbose_name="title")),
+                ("content", models.TextField(verbose_name="content", blank=True)),
+                (
+                    "enable_comments",
+                    models.BooleanField(default=False, verbose_name="enable comments"),
+                ),
+                (
+                    "template_name",
                     models.CharField(
-                        max_length=100, verbose_name="python model class name"
+                        help_text=(
+                            "Example: “flatpages/contact_page.html”. If this isn’t "
+                            "provided, the system will use “flatpages/default.html”."
+                        ),
+                        max_length=70,
+                        verbose_name="template name",
+                        blank=True,
                     ),
+                ),
+                (
+                    "registration_required",
+                    models.BooleanField(
+                        default=False,
+                        help_text=(
+                            "If this is checked, only logged-in users will be able to "
+                            "view the page."
+                        ),
+                        verbose_name="registration required",
+                    ),
+                ),
+                (
+                    "sites",
+                    models.ManyToManyField(to="sites.Site", verbose_name="sites"),
                 ),
             ],
             options={
-                "ordering": ("name",),
-                "db_table": "django_content_type",
-                "verbose_name": "content type",
-                "verbose_name_plural": "content types",
+                "ordering": ["url"],
+                "db_table": "django_flatpage",
+                "verbose_name": "flat page",
+                "verbose_name_plural": "flat pages",
             },
             bases=(models.Model,),
-            managers=[
-                ("objects", django.contrib.contenttypes.models.ContentTypeManager()),
-            ],
-        ),
-        migrations.AlterUniqueTogether(
-            name="contenttype",
-            unique_together={("app_label", "model")},
         ),
     ]

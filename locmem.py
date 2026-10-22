@@ -1,26 +1,33 @@
 """
-Wrapper for loading templates from a plain Python dict.
+Backend for test environment.
 """
 
-from django.template import Origin, TemplateDoesNotExist
+import copy
 
-from .base import Loader as BaseLoader
+from django.core import mail
+from django.core.mail.backends.base import BaseEmailBackend
 
 
-class Loader(BaseLoader):
-    def __init__(self, engine, templates_dict):
-        self.templates_dict = templates_dict
-        super().__init__(engine)
+class EmailBackend(BaseEmailBackend):
+    """
+    An email backend for use during test sessions.
 
-    def get_contents(self, origin):
-        try:
-            return self.templates_dict[origin.name]
-        except KeyError:
-            raise TemplateDoesNotExist(origin)
+    The test connection stores email messages in a dummy outbox,
+    rather than sending them out on the wire.
 
-    def get_template_sources(self, template_name):
-        yield Origin(
-            name=template_name,
-            template_name=template_name,
-            loader=self,
-        )
+    The dummy outbox is accessible through the outbox instance attribute.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not hasattr(mail, "outbox"):
+            mail.outbox = []
+
+    def send_messages(self, messages):
+        """Redirect messages to the dummy outbox"""
+        msg_count = 0
+        for message in messages:  # .message() triggers header validation
+            message.message()
+            mail.outbox.append(copy.deepcopy(message))
+            msg_count += 1
+        return msg_count

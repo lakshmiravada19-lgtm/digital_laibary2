@@ -1,206 +1,711 @@
+"""
+Base classes for writing management commands (named commands which can
+be executed through ``django-admin`` or ``manage.py``).
+"""
+
+import argparse
 import os
-import pathlib
+import sys
+from argparse import ArgumentParser, HelpFormatter
+from functools import partial
+from io import TextIOBase
 
-from django.core.exceptions import SuspiciousFileOperation
-from django.core.files import File
-from django.core.files.utils import validate_file_name
-from django.utils.crypto import get_random_string
-from django.utils.text import get_valid_filename
+import django
+from django.core import checks
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.color import color_style, no_style
+from django.db import DEFAULT_DB_ALIAS, connections
+from django.utils.version import PY314
+
+ALL_CHECKS = "__all__"
 
 
-class Storage:
+class CommandError(Exception):
     """
-    A base storage class, providing some default behaviors that all other
-    storage systems can inherit or override, as necessary.
+    Exception class indicating a problem while executing a management
+    command.
+
+    If this exception is raised during the execution of a management
+    command, it will be caught and turned into a nicely-printed error
+    message to the appropriate output stream (i.e., stderr); as a
+    result, raising this exception (with a sensible description of the
+    error) is the preferred way to indicate that something has gone
+    wrong in the execution of a command.
     """
 
-    # The following methods represent a public interface to private methods.
-    # These shouldn't be overridden by subclasses unless absolutely necessary.
+    def __init__(self, *args, returncode=1, **kwargs):
+        self.returncode = returncode
+        super().__init__(*args, **kwargs)
 
-    def open(self, name, mode="rb"):
-        """Retrieve the specified file from storage."""
-        return self._open(name, mode)
 
-    def save(self, name, content, max_length=None):
-        """
-        Save new content to the file specified by name. The content should be
-        a proper File object or any Python file-like object, ready to be read
-        from the beginning.
-        """
-        # Get the proper name for the file, as it will actually be saved.
-        if name is None:
-            name = content.name
+class SystemCheckError(CommandError):
+    """
+    The system check framework detected unrecoverable errors.
+    """
 
-        if not hasattr(content, "chunks"):
-            content = File(content, name)
+    pass
 
-        # Ensure that the name is valid, before and after having the storage
-        # system potentially modifying the name. This duplicates the check made
-        # inside `get_available_name` but it's necessary for those cases where
-        # `get_available_name` is overriden and validation is lost.
-        validate_file_name(name, allow_relative_path=True)
 
-        # Potentially find a different name depending on storage constraints.
-        name = self.get_available_name(name, max_length=max_length)
-        # Validate the (potentially) new name.
-        validate_file_name(name, allow_relative_path=True)
+class CommandParser(ArgumentParser):
+    """
+    Customized ArgumentParser class to improve some error messages and prevent
+    SystemExit in several occasions, as SystemExit is unacceptable when a
+    command is called programmatically.
+    """
 
-        # The save operation should return the actual name of the file saved.
-        name = self._save(name, content)
-        # Ensure that the name returned from the storage system is still valid.
-        validate_file_name(name, allow_relative_path=True)
-        return name
+    def __init__(
+        self, *, missing_args_message=None, called_from_command_line=None, **kwargs
+    ):
+        self.missing_args_message = missing_args_message
+        self.called_from_command_line = called_from_command_line
+        if PY314:
+            if os.environ.get("DJANGO_COLORS") == "nocolor" or "--no-color" in sys.argv:
+                kwargs.setdefault("color", False)
+        super().__init__(**kwargs)
 
-    def is_name_available(self, name, max_length=None):
-        exceeds_max_length = max_length and len(name) > max_length
-        return not self.exists(name) and not exceeds_max_length
+    def parse_args(self, args=None, namespace=None):
+        # Catch missing argument for a better error message
+        if self.missing_args_message and not (
+            args or any(not arg.startswith("-") for arg in args)
+        ):
+            self.error(self.missing_args_message)
+        return super().parse_args(args, namespace)
 
-    # These methods are part of the public API, with default implementations.
+    def error(self, message):
+        if self.called_from_command_line:
+            super().error(message)
+        else:
+            raise CommandError("Error: %s" % message)
 
-    def get_valid_name(self, name):
-        """
-        Return a filename, based on the provided filename, that's suitable for
-        use in the target storage system.
-        """
-        return get_valid_filename(name)
-
-    def get_alternative_name(self, file_root, file_ext):
-        """
-        Return an alternative filename, by adding an underscore and a random 7
-        character alphanumeric string (before the file extension, if one
-        exists) to the filename.
-        """
-        return "%s_%s%s" % (file_root, get_random_string(7), file_ext)
-
-    def get_available_name(self, name, max_length=None):
-        """
-        Return a filename that's free on the target storage system and
-        available for new content to be written to.
-        """
-        name = str(name).replace("\\", "/")
-        dir_name, file_name = os.path.split(name)
-        if ".." in pathlib.PurePath(dir_name).parts:
-            raise SuspiciousFileOperation(
-                "Detected path traversal attempt in '%s'" % dir_name
+    def add_subparsers(self, **kwargs):
+        parser_class = kwargs.get("parser_class", type(self))
+        if issubclass(parser_class, CommandParser):
+            kwargs["parser_class"] = partial(
+                parser_class,
+                called_from_command_line=self.called_from_command_line,
             )
-        validate_file_name(file_name)
-        file_ext = "".join(pathlib.PurePath(file_name).suffixes)
-        file_root = file_name.removesuffix(file_ext)
-        # If the filename is not available, generate an alternative
-        # filename until one is available.
-        # Truncate original name if required, so the new filename does not
-        # exceed the max_length.
-        while not self.is_name_available(name, max_length=max_length):
-            # file_ext includes the dot.
-            name = os.path.join(
-                dir_name, self.get_alternative_name(file_root, file_ext)
+        return super().add_subparsers(**kwargs)
+
+
+def handle_default_options(options):
+    """
+    Include any default options that all commands should accept here
+    so that ManagementUtility can handle them before searching for
+    user commands.
+    """
+    if options.settings:
+        os.environ["DJANGO_SETTINGS_MODULE"] = options.settings
+    if options.pythonpath:
+        sys.path.insert(0, options.pythonpath)
+
+
+def no_translations(handle_func):
+    """Decorator that forces a command to run with translations deactivated."""
+
+    def wrapper(*args, **kwargs):
+        from django.utils import translation
+
+        saved_locale = translation.get_language()
+        translation.deactivate_all()
+        try:
+            res = handle_func(*args, **kwargs)
+        finally:
+            if saved_locale is not None:
+                translation.activate(saved_locale)
+        return res
+
+    return wrapper
+
+
+class DjangoHelpFormatter(HelpFormatter):
+    """
+    Customized formatter so that command-specific arguments appear in the
+    --help output before arguments common to all commands.
+    """
+
+    show_last = {
+        "--version",
+        "--verbosity",
+        "--traceback",
+        "--settings",
+        "--pythonpath",
+        "--no-color",
+        "--force-color",
+        "--skip-checks",
+    }
+
+    def _reordered_actions(self, actions):
+        return sorted(
+            actions, key=lambda a: set(a.option_strings) & self.show_last != set()
+        )
+
+    def add_usage(self, usage, actions, *args, **kwargs):
+        super().add_usage(usage, self._reordered_actions(actions), *args, **kwargs)
+
+    def add_arguments(self, actions):
+        super().add_arguments(self._reordered_actions(actions))
+
+
+class OutputWrapper:
+    """
+    Wrapper around stdout/stderr
+    """
+
+    @property
+    def style_func(self):
+        return self._style_func
+
+    @style_func.setter
+    def style_func(self, style_func):
+        if style_func and self.isatty():
+            self._style_func = style_func
+        else:
+            self._style_func = lambda x: x
+
+    def __init__(self, out, ending="\n"):
+        self._out = out
+        self.style_func = None
+        self.ending = ending
+
+    def __getattr__(self, name):
+        return getattr(self._out, name)
+
+    def flush(self):
+        if hasattr(self._out, "flush"):
+            self._out.flush()
+
+    def isatty(self):
+        return hasattr(self._out, "isatty") and self._out.isatty()
+
+    def write(self, msg="", style_func=None, ending=None):
+        ending = self.ending if ending is None else ending
+        if ending and not msg.endswith(ending):
+            msg += ending
+        style_func = style_func or self.style_func
+        self._out.write(style_func(msg))
+
+
+TextIOBase.register(OutputWrapper)
+
+
+class BaseCommand:
+    """
+    The base class from which all management commands ultimately
+    derive.
+
+    Use this class if you want access to all of the mechanisms which
+    parse the command-line arguments and work out what code to call in
+    response; if you don't need to change any of that behavior,
+    consider using one of the subclasses defined in this file.
+
+    If you are interested in overriding/customizing various aspects of
+    the command-parsing and -execution behavior, the normal flow works
+    as follows:
+
+    1. ``django-admin`` or ``manage.py`` loads the command class
+       and calls its ``run_from_argv()`` method.
+
+    2. The ``run_from_argv()`` method calls ``create_parser()`` to get
+       an ``ArgumentParser`` for the arguments, parses them, performs
+       any environment changes requested by options like
+       ``pythonpath``, and then calls the ``execute()`` method,
+       passing the parsed arguments.
+
+    3. The ``execute()`` method attempts to carry out the command by
+       calling the ``handle()`` method with the parsed arguments; any
+       output produced by ``handle()`` will be printed to standard
+       output and, if the command is intended to produce a block of
+       SQL statements, will be wrapped in ``BEGIN`` and ``COMMIT``.
+
+    4. If ``handle()`` or ``execute()`` raised any exception (e.g.
+       ``CommandError``), ``run_from_argv()`` will  instead print an error
+       message to ``stderr``.
+
+    Thus, the ``handle()`` method is typically the starting point for
+    subclasses; many built-in commands and command types either place
+    all of their logic in ``handle()``, or perform some additional
+    parsing work in ``handle()`` and then delegate from it to more
+    specialized methods as needed.
+
+    Several attributes affect behavior at various steps along the way:
+
+    ``help``
+        A short description of the command, which will be printed in
+        help messages.
+
+    ``output_transaction``
+        A boolean indicating whether the command outputs SQL
+        statements; if ``True``, the output will automatically be
+        wrapped with ``BEGIN;`` and ``COMMIT;``. Default value is
+        ``False``.
+
+    ``requires_migrations_checks``
+        A boolean; if ``True``, the command prints a warning if the set of
+        migrations on disk don't match the migrations in the database.
+
+    ``requires_system_checks``
+        A list or tuple of tags, e.g. [Tags.staticfiles, Tags.models]. System
+        checks registered in the chosen tags will be checked for errors prior
+        to executing the command. The value '__all__' can be used to specify
+        that all system checks should be performed. Default value is '__all__'.
+
+        To validate an individual application's models
+        rather than all applications' models, call
+        ``self.check(app_configs)`` from ``handle()``, where ``app_configs``
+        is the list of application's configuration provided by the
+        app registry.
+
+    ``stealth_options``
+        A tuple of any options the command uses which aren't defined by the
+        argument parser.
+    """
+
+    # Metadata about this command.
+    help = ""
+
+    # Configuration shortcuts that alter various logic.
+    _called_from_command_line = False
+    output_transaction = False  # Whether to wrap the output in a "BEGIN; COMMIT;"
+    requires_migrations_checks = False
+    requires_system_checks = "__all__"
+    # Arguments, common to all commands, which aren't defined by the argument
+    # parser.
+    base_stealth_options = ("stderr", "stdout")
+    # Command-specific options not defined by the argument parser.
+    stealth_options = ()
+    suppressed_base_arguments = set()
+
+    def __init__(self, stdout=None, stderr=None, no_color=False, force_color=False):
+        self.stdout = OutputWrapper(stdout or sys.stdout)
+        self.stderr = OutputWrapper(stderr or sys.stderr)
+        if no_color and force_color:
+            raise CommandError("'no_color' and 'force_color' can't be used together.")
+        if no_color:
+            self.style = no_style()
+        else:
+            self.style = color_style(force_color)
+            self.stderr.style_func = self.style.ERROR
+        if (
+            not isinstance(self.requires_system_checks, (list, tuple))
+            and self.requires_system_checks != ALL_CHECKS
+        ):
+            raise TypeError("requires_system_checks must be a list or tuple.")
+
+    def get_version(self):
+        """
+        Return the Django version, which should be correct for all built-in
+        Django commands. User-supplied commands can override this method to
+        return their own version.
+        """
+        return django.get_version()
+
+    def create_parser(self, prog_name, subcommand, **kwargs):
+        """
+        Create and return the ``ArgumentParser`` which will be used to
+        parse the arguments to this command.
+        """
+        kwargs.setdefault("formatter_class", DjangoHelpFormatter)
+        parser = CommandParser(
+            prog="%s %s" % (os.path.basename(prog_name), subcommand),
+            description=self.help or None,
+            missing_args_message=getattr(self, "missing_args_message", None),
+            called_from_command_line=getattr(self, "_called_from_command_line", None),
+            **kwargs,
+        )
+        self.add_base_argument(
+            parser,
+            "--version",
+            action="version",
+            version=self.get_version(),
+            help="Show program's version number and exit.",
+        )
+        self.add_base_argument(
+            parser,
+            "-v",
+            "--verbosity",
+            default=1,
+            type=int,
+            choices=[0, 1, 2, 3],
+            help=(
+                "Verbosity level; 0=minimal output, 1=normal output, 2=verbose output, "
+                "3=very verbose output"
+            ),
+        )
+        self.add_base_argument(
+            parser,
+            "--settings",
+            help=(
+                "The Python path to a settings module, e.g. "
+                '"myproject.settings.main". If this isn\'t provided, the '
+                "DJANGO_SETTINGS_MODULE environment variable will be used."
+            ),
+        )
+        self.add_base_argument(
+            parser,
+            "--pythonpath",
+            help=(
+                "A directory to add to the Python path, e.g. "
+                '"/home/djangoprojects/myproject".'
+            ),
+        )
+        self.add_base_argument(
+            parser,
+            "--traceback",
+            action="store_true",
+            help="Display a full stack trace on CommandError exceptions.",
+        )
+        self.add_base_argument(
+            parser,
+            "--no-color",
+            action="store_true",
+            help="Don't colorize the command output.",
+        )
+        self.add_base_argument(
+            parser,
+            "--force-color",
+            action="store_true",
+            help="Force colorization of the command output.",
+        )
+        if self.requires_system_checks:
+            parser.add_argument(
+                "--skip-checks",
+                action="store_true",
+                help="Skip system checks.",
             )
-            if max_length is None:
-                continue
-            # Truncate file_root if max_length exceeded.
-            truncation = len(name) - max_length
-            if truncation > 0:
-                file_root = file_root[:-truncation]
-                # Entire file_root was truncated in attempt to find an
-                # available filename.
-                if not file_root:
-                    raise SuspiciousFileOperation(
-                        'Storage can not find an available filename for "%s". '
-                        "Please make sure that the corresponding file field "
-                        'allows sufficient "max_length".' % name
-                    )
-                name = os.path.join(
-                    dir_name, self.get_alternative_name(file_root, file_ext)
+        self.add_arguments(parser)
+        return parser
+
+    def add_arguments(self, parser):
+        """
+        Entry point for subclassed commands to add custom arguments.
+        """
+        pass
+
+    def add_base_argument(self, parser, *args, **kwargs):
+        """
+        Call the parser's add_argument() method, suppressing the help text
+        according to BaseCommand.suppressed_base_arguments.
+        """
+        for arg in args:
+            if arg in self.suppressed_base_arguments:
+                kwargs["help"] = argparse.SUPPRESS
+                break
+        parser.add_argument(*args, **kwargs)
+
+    def print_help(self, prog_name, subcommand):
+        """
+        Print the help message for this command, derived from
+        ``self.usage()``.
+        """
+        parser = self.create_parser(prog_name, subcommand)
+        parser.print_help()
+
+    def run_from_argv(self, argv):
+        """
+        Set up any environment changes requested (e.g., Python path
+        and Django settings), then run this command. If the
+        command raises a ``CommandError``, intercept it and print it sensibly
+        to stderr. If the ``--traceback`` option is present or the raised
+        ``Exception`` is not ``CommandError``, raise it.
+        """
+        self._called_from_command_line = True
+        parser = self.create_parser(argv[0], argv[1])
+
+        options = parser.parse_args(argv[2:])
+        cmd_options = vars(options)
+        # Move positional args out of options to mimic legacy optparse
+        args = cmd_options.pop("args", ())
+        handle_default_options(options)
+        try:
+            self.execute(*args, **cmd_options)
+        except CommandError as e:
+            if options.traceback:
+                raise
+
+            # SystemCheckError takes care of its own formatting.
+            if isinstance(e, SystemCheckError):
+                self.stderr.write(str(e), lambda x: x)
+            else:
+                self.stderr.write("%s: %s" % (e.__class__.__name__, e))
+            sys.exit(e.returncode)
+        finally:
+            try:
+                connections.close_all()
+            except ImproperlyConfigured:
+                # Ignore if connections aren't setup at this point (e.g. no
+                # configured settings).
+                pass
+
+    def execute(self, *args, **options):
+        """
+        Try to execute this command, performing system checks if needed (as
+        controlled by the ``requires_system_checks`` attribute, except if
+        force-skipped).
+        """
+        if options["force_color"] and options["no_color"]:
+            raise CommandError(
+                "The --no-color and --force-color options can't be used together."
+            )
+        if options["force_color"]:
+            self.style = color_style(force_color=True)
+        elif options["no_color"]:
+            self.style = no_style()
+            self.stderr.style_func = None
+        if options.get("stdout"):
+            self.stdout = OutputWrapper(options["stdout"])
+        if options.get("stderr"):
+            self.stderr = OutputWrapper(options["stderr"])
+
+        if self.requires_system_checks and not options["skip_checks"]:
+            check_kwargs = self.get_check_kwargs(options)
+            self.check(**check_kwargs)
+        if self.requires_migrations_checks:
+            self.check_migrations()
+        output = self.handle(*args, **options)
+        if output:
+            if self.output_transaction:
+                connection = connections[options.get("database", DEFAULT_DB_ALIAS)]
+                output = "%s\n%s\n%s" % (
+                    self.style.SQL_KEYWORD(connection.ops.start_transaction_sql()),
+                    output,
+                    self.style.SQL_KEYWORD(connection.ops.end_transaction_sql()),
                 )
-        return name
+            self.stdout.write(output)
+        return output
 
-    def generate_filename(self, filename):
+    def get_check_kwargs(self, options):
+        if self.requires_system_checks == ALL_CHECKS:
+            return {}
+        return {"tags": self.requires_system_checks}
+
+    def check(
+        self,
+        app_configs=None,
+        tags=None,
+        display_num_errors=False,
+        include_deployment_checks=False,
+        fail_level=checks.ERROR,
+        databases=None,
+    ):
         """
-        Validate the filename by calling get_valid_name() and return a filename
-        to be passed to the save() method.
+        Use the system check framework to validate entire Django project.
+        Raise CommandError for any serious message (error or critical errors).
+        If there are only light messages (like warnings), print them to stderr
+        and don't raise an exception.
         """
-        filename = str(filename).replace("\\", "/")
-        # `filename` may include a path as returned by FileField.upload_to.
-        dirname, filename = os.path.split(filename)
-        if ".." in pathlib.PurePath(dirname).parts:
-            raise SuspiciousFileOperation(
-                "Detected path traversal attempt in '%s'" % dirname
+        all_issues = checks.run_checks(
+            app_configs=app_configs,
+            tags=tags,
+            include_deployment_checks=include_deployment_checks,
+            databases=databases,
+        )
+
+        header, body, footer = "", "", ""
+        visible_issue_count = 0  # excludes silenced warnings
+
+        if all_issues:
+            debugs = [
+                e for e in all_issues if e.level < checks.INFO and not e.is_silenced()
+            ]
+            infos = [
+                e
+                for e in all_issues
+                if checks.INFO <= e.level < checks.WARNING and not e.is_silenced()
+            ]
+            warnings = [
+                e
+                for e in all_issues
+                if checks.WARNING <= e.level < checks.ERROR and not e.is_silenced()
+            ]
+            errors = [
+                e
+                for e in all_issues
+                if checks.ERROR <= e.level < checks.CRITICAL and not e.is_silenced()
+            ]
+            criticals = [
+                e
+                for e in all_issues
+                if checks.CRITICAL <= e.level and not e.is_silenced()
+            ]
+            sorted_issues = [
+                (criticals, "CRITICALS"),
+                (errors, "ERRORS"),
+                (warnings, "WARNINGS"),
+                (infos, "INFOS"),
+                (debugs, "DEBUGS"),
+            ]
+
+            for issues, group_name in sorted_issues:
+                if issues:
+                    visible_issue_count += len(issues)
+                    formatted = (
+                        (
+                            self.style.ERROR(str(e))
+                            if e.is_serious()
+                            else self.style.WARNING(str(e))
+                        )
+                        for e in issues
+                    )
+                    formatted = "\n".join(sorted(formatted))
+                    body += "\n%s:\n%s\n" % (group_name, formatted)
+
+        if visible_issue_count:
+            header = "System check identified some issues:\n"
+
+        if display_num_errors:
+            if visible_issue_count:
+                footer += "\n"
+            footer += "System check identified %s (%s silenced)." % (
+                (
+                    "no issues"
+                    if visible_issue_count == 0
+                    else (
+                        "1 issue"
+                        if visible_issue_count == 1
+                        else "%s issues" % visible_issue_count
+                    )
+                ),
+                len(all_issues) - visible_issue_count,
             )
-        return os.path.normpath(os.path.join(dirname, self.get_valid_name(filename)))
 
-    def path(self, name):
-        """
-        Return a local filesystem path where the file can be retrieved using
-        Python's built-in open() function. Storage systems that can't be
-        accessed using open() should *not* implement this method.
-        """
-        raise NotImplementedError("This backend doesn't support absolute paths.")
+        if any(e.is_serious(fail_level) and not e.is_silenced() for e in all_issues):
+            msg = self.style.ERROR("SystemCheckError: %s" % header) + body + footer
+            raise SystemCheckError(msg)
+        else:
+            msg = header + body + footer
 
-    # The following methods form the public API for storage systems, but with
-    # no default implementations. Subclasses must implement *all* of these.
+        if msg:
+            if visible_issue_count:
+                self.stderr.write(msg, lambda x: x)
+            else:
+                self.stdout.write(msg)
 
-    def delete(self, name):
+    def check_migrations(self):
         """
-        Delete the specified file from the storage system.
+        Print a warning if the set of migrations on disk don't match the
+        migrations in the database.
+        """
+        from django.db.migrations.executor import MigrationExecutor
+
+        try:
+            executor = MigrationExecutor(connections[DEFAULT_DB_ALIAS])
+        except ImproperlyConfigured:
+            # No databases are configured (or the dummy one)
+            return
+
+        plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+        if plan:
+            apps_waiting_migration = sorted(
+                {migration.app_label for migration, backwards in plan}
+            )
+            self.stdout.write(
+                self.style.NOTICE(
+                    "\nYou have %(unapplied_migration_count)s unapplied migration(s). "
+                    "Your project may not work properly until you apply the "
+                    "migrations for app(s): %(apps_waiting_migration)s."
+                    % {
+                        "unapplied_migration_count": len(plan),
+                        "apps_waiting_migration": ", ".join(apps_waiting_migration),
+                    }
+                )
+            )
+            self.stdout.write(
+                self.style.NOTICE("Run 'python manage.py migrate' to apply them.")
+            )
+
+    def handle(self, *args, **options):
+        """
+        The actual logic of the command. Subclasses must implement
+        this method.
         """
         raise NotImplementedError(
-            "subclasses of Storage must provide a delete() method"
+            "subclasses of BaseCommand must provide a handle() method"
         )
 
-    def exists(self, name):
-        """
-        Return True if a file referenced by the given name already exists in the
-        storage system, or False if the name is available for a new file.
-        """
-        raise NotImplementedError(
-            "subclasses of Storage must provide an exists() method"
+
+class AppCommand(BaseCommand):
+    """
+    A management command which takes one or more installed application labels
+    as arguments, and does something with each of them.
+
+    Rather than implementing ``handle()``, subclasses must implement
+    ``handle_app_config()``, which will be called once for each application.
+    """
+
+    missing_args_message = "Enter at least one application label."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "args",
+            metavar="app_label",
+            nargs="+",
+            help="One or more application label.",
         )
 
-    def listdir(self, path):
+    def handle(self, *app_labels, **options):
+        from django.apps import apps
+
+        try:
+            app_configs = [apps.get_app_config(app_label) for app_label in app_labels]
+        except (LookupError, ImportError) as e:
+            raise CommandError(
+                "%s. Are you sure your INSTALLED_APPS setting is correct?" % e
+            )
+        output = []
+        for app_config in app_configs:
+            app_output = self.handle_app_config(app_config, **options)
+            if app_output:
+                output.append(app_output)
+        return "\n".join(output)
+
+    def handle_app_config(self, app_config, **options):
         """
-        List the contents of the specified path. Return a 2-tuple of lists:
-        the first item being directories, the second item being files.
+        Perform the command's actions for app_config, an AppConfig instance
+        corresponding to an application label given on the command line.
         """
         raise NotImplementedError(
-            "subclasses of Storage must provide a listdir() method"
+            "Subclasses of AppCommand must provide a handle_app_config() method."
         )
 
-    def size(self, name):
-        """
-        Return the total size, in bytes, of the file specified by name.
-        """
-        raise NotImplementedError("subclasses of Storage must provide a size() method")
 
-    def url(self, name):
-        """
-        Return an absolute URL where the file's contents can be accessed
-        directly by a web browser.
-        """
-        raise NotImplementedError("subclasses of Storage must provide a url() method")
+class LabelCommand(BaseCommand):
+    """
+    A management command which takes one or more arbitrary arguments
+    (labels) on the command line, and does something with each of
+    them.
 
-    def get_accessed_time(self, name):
+    Rather than implementing ``handle()``, subclasses must implement
+    ``handle_label()``, which will be called once for each label.
+
+    If the arguments should be names of installed applications, use
+    ``AppCommand`` instead.
+    """
+
+    label = "label"
+    missing_args_message = "Enter at least one %s."
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if self.missing_args_message == LabelCommand.missing_args_message:
+            self.missing_args_message = self.missing_args_message % self.label
+
+    def add_arguments(self, parser):
+        parser.add_argument("args", metavar=self.label, nargs="+")
+
+    def handle(self, *labels, **options):
+        output = []
+        for label in labels:
+            label_output = self.handle_label(label, **options)
+            if label_output:
+                output.append(label_output)
+        return "\n".join(output)
+
+    def handle_label(self, label, **options):
         """
-        Return the last accessed time (as a datetime) of the file specified by
-        name. The datetime will be timezone-aware if USE_TZ=True.
+        Perform the command's actions for ``label``, which will be the
+        string as given on the command line.
         """
         raise NotImplementedError(
-            "subclasses of Storage must provide a get_accessed_time() method"
-        )
-
-    def get_created_time(self, name):
-        """
-        Return the creation time (as a datetime) of the file specified by name.
-        The datetime will be timezone-aware if USE_TZ=True.
-        """
-        raise NotImplementedError(
-            "subclasses of Storage must provide a get_created_time() method"
-        )
-
-    def get_modified_time(self, name):
-        """
-        Return the last modified time (as a datetime) of the file specified by
-        name. The datetime will be timezone-aware if USE_TZ=True.
-        """
-        raise NotImplementedError(
-            "subclasses of Storage must provide a get_modified_time() method"
+            "subclasses of LabelCommand must provide a handle_label() method"
         )

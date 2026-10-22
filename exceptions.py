@@ -1,44 +1,60 @@
-"""
-This module contains generic exceptions used by template backends. Although,
-due to historical reasons, the Django template language also internally uses
-these exceptions, other exceptions specific to the DTL should not be added
-here.
-"""
+from django.db import DatabaseError
 
 
-class TemplateDoesNotExist(Exception):
-    """
-    The exception used when a template does not exist. Optional arguments:
+class AmbiguityError(Exception):
+    """More than one migration matches a name prefix."""
 
-    backend
-        The template backend class used when raising this exception.
-
-    tried
-        A list of sources that were tried when finding the template. This
-        is formatted as a list of tuples containing (origin, status), where
-        origin is an Origin object or duck type and status is a string with the
-        reason the template wasn't found.
-
-    chain
-        A list of intermediate TemplateDoesNotExist exceptions. This is used to
-        encapsulate multiple exceptions when loading templates from multiple
-        engines.
-    """
-
-    def __init__(self, msg, tried=None, backend=None, chain=None):
-        self.backend = backend
-        if tried is None:
-            tried = []
-        self.tried = tried
-        if chain is None:
-            chain = []
-        self.chain = chain
-        super().__init__(msg)
+    pass
 
 
-class TemplateSyntaxError(Exception):
-    """
-    The exception used for syntax errors during parsing or rendering.
-    """
+class BadMigrationError(Exception):
+    """There's a bad migration (unreadable/bad format/etc.)."""
 
+    pass
+
+
+class CircularDependencyError(Exception):
+    """There's an impossible-to-resolve circular dependency."""
+
+    pass
+
+
+class InconsistentMigrationHistory(Exception):
+    """An applied migration has some of its dependencies not applied."""
+
+    pass
+
+
+class InvalidBasesError(ValueError):
+    """A model's base classes can't be resolved."""
+
+    pass
+
+
+class IrreversibleError(RuntimeError):
+    """An irreversible migration is about to be reversed."""
+
+    pass
+
+
+class NodeNotFoundError(LookupError):
+    """An attempt on a node is made that is not available in the graph."""
+
+    def __init__(self, message, node, origin=None):
+        self.message = message
+        self.origin = origin
+        self.node = node
+
+    def __str__(self):
+        return self.message
+
+    def __repr__(self):
+        return "NodeNotFoundError(%r)" % (self.node,)
+
+
+class MigrationSchemaMissing(DatabaseError):
+    pass
+
+
+class InvalidMigrationPlan(ValueError):
     pass

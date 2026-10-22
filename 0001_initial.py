@@ -1,64 +1,37 @@
+import django.contrib.sessions.models
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-    dependencies = [
-        ("sites", "0001_initial"),
-    ]
+    dependencies = []
 
     operations = [
         migrations.CreateModel(
-            name="Redirect",
+            name="Session",
             fields=[
                 (
-                    "id",
-                    models.AutoField(
-                        verbose_name="ID",
+                    "session_key",
+                    models.CharField(
+                        max_length=40,
                         serialize=False,
-                        auto_created=True,
+                        verbose_name="session key",
                         primary_key=True,
                     ),
                 ),
+                ("session_data", models.TextField(verbose_name="session data")),
                 (
-                    "site",
-                    models.ForeignKey(
-                        to="sites.Site",
-                        on_delete=models.CASCADE,
-                        verbose_name="site",
-                    ),
-                ),
-                (
-                    "old_path",
-                    models.CharField(
-                        help_text=(
-                            "This should be an absolute path, excluding the domain "
-                            "name. Example: “/events/search/”."
-                        ),
-                        max_length=200,
-                        verbose_name="redirect from",
-                        db_index=True,
-                    ),
-                ),
-                (
-                    "new_path",
-                    models.CharField(
-                        help_text=(
-                            "This can be either an absolute path (as above) or a full "
-                            "URL starting with “http://”."
-                        ),
-                        max_length=200,
-                        verbose_name="redirect to",
-                        blank=True,
-                    ),
+                    "expire_date",
+                    models.DateTimeField(verbose_name="expire date", db_index=True),
                 ),
             ],
             options={
-                "ordering": ["old_path"],
-                "unique_together": {("site", "old_path")},
-                "db_table": "django_redirect",
-                "verbose_name": "redirect",
-                "verbose_name_plural": "redirects",
+                "abstract": False,
+                "db_table": "django_session",
+                "verbose_name": "session",
+                "verbose_name_plural": "sessions",
             },
-            bases=(models.Model,),
+            managers=[
+                ("objects", django.contrib.sessions.models.SessionManager()),
+            ],
         ),
     ]

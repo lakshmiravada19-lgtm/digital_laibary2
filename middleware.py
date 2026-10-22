@@ -1,291 +1,199 @@
-import warnings
-from functools import partial
-from urllib.parse import urlsplit
+from __future__ import annotations
 
-from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
+import os
+from posixpath import basename
+from urllib.parse import urlparse
 
 from django.conf import settings
-from django.contrib import auth
-from django.contrib.auth import REDIRECT_FIELD_NAME, load_backend
-from django.contrib.auth.backends import RemoteUserBackend
-from django.contrib.auth.views import redirect_to_login
-from django.core.exceptions import ImproperlyConfigured
-from django.shortcuts import resolve_url
-from django.utils.deprecation import MiddlewareMixin, RemovedInDjango61Warning
-from django.utils.functional import SimpleLazyObject
+from django.contrib.staticfiles import finders
+from django.contrib.staticfiles.storage import staticfiles_storage
+from django.http import FileResponse
+
+from whitenoise.base import WhiteNoise
+from whitenoise.string_utils import ensure_leading_trailing_slash
+
+__all__ = ["WhiteNoiseMiddleware"]
 
 
-def get_user(request):
-    if not hasattr(request, "_cached_user"):
-        request._cached_user = auth.get_user(request)
-    return request._cached_user
-
-
-async def auser(request):
-    if not hasattr(request, "_acached_user"):
-        request._acached_user = await auth.aget_user(request)
-    return request._acached_user
-
-
-class AuthenticationMiddleware(MiddlewareMixin):
-    def process_request(self, request):
-        if not hasattr(request, "session"):
-            raise ImproperlyConfigured(
-                "The Django authentication middleware requires session "
-                "middleware to be installed. Edit your MIDDLEWARE setting to "
-                "insert "
-                "'django.contrib.sessions.middleware.SessionMiddleware' before "
-                "'django.contrib.auth.middleware.AuthenticationMiddleware'."
-            )
-        request.user = SimpleLazyObject(lambda: get_user(request))
-        request.auser = partial(auser, request)
-
-
-class LoginRequiredMiddleware(MiddlewareMixin):
+class WhiteNoiseFileResponse(FileResponse):
     """
-    Middleware that redirects all unauthenticated requests to a login page.
-
-    Views using the login_not_required decorator will not be redirected.
+    Wrap Django's FileResponse to prevent setting any default headers. For the
+    most part these just duplicate work already done by WhiteNoise but in some
+    cases (e.g. the content-disposition header introduced in Django 3.0) they
+    are actively harmful.
     """
 
-    redirect_field_name = REDIRECT_FIELD_NAME
+    def set_headers(self, *args, **kwargs):
+        pass
 
-    def process_view(self, request, view_func, view_args, view_kwargs):
-        if request.user.is_authenticated:
-            return None
 
-        if not getattr(view_func, "login_required", True):
-            return None
+class WhiteNoiseMiddleware(WhiteNoise):
+    """
+    Wrap WhiteNoise to allow it to function as Django middleware, rather
+    than WSGI middleware.
+    """
 
-        return self.handle_no_permission(request, view_func)
+    def __init__(self, get_response=None, settings=settings):
+        self.get_response = get_response
 
-    def get_login_url(self, view_func):
-        login_url = getattr(view_func, "login_url", None) or settings.LOGIN_URL
-        if not login_url:
-            raise ImproperlyConfigured(
-                "No login URL to redirect to. Define settings.LOGIN_URL or "
-                "provide a login_url via the 'django.contrib.auth.decorators."
-                "login_required' decorator."
-            )
-        return str(login_url)
+        try:
+            autorefresh: bool = settings.WHITENOISE_AUTOREFRESH
+        except AttributeError:
+            autorefresh = settings.DEBUG
+        try:
+            max_age = settings.WHITENOISE_MAX_AGE
+        except AttributeError:
+            if settings.DEBUG:
+                max_age = 0
+            else:
+                max_age = 60
+        try:
+            allow_all_origins = settings.WHITENOISE_ALLOW_ALL_ORIGINS
+        except AttributeError:
+            allow_all_origins = True
+        try:
+            charset = settings.WHITENOISE_CHARSET
+        except AttributeError:
+            charset = "utf-8"
+        try:
+            mimetypes = settings.WHITENOISE_MIMETYPES
+        except AttributeError:
+            mimetypes = None
+        try:
+            add_headers_function = settings.WHITENOISE_ADD_HEADERS_FUNCTION
+        except AttributeError:
+            add_headers_function = None
+        try:
+            index_file = settings.WHITENOISE_INDEX_FILE
+        except AttributeError:
+            index_file = None
+        try:
+            immutable_file_test = settings.WHITENOISE_IMMUTABLE_FILE_TEST
+        except AttributeError:
+            immutable_file_test = None
 
-    def get_redirect_field_name(self, view_func):
-        return getattr(view_func, "redirect_field_name", self.redirect_field_name)
-
-    def handle_no_permission(self, request, view_func):
-        path = request.build_absolute_uri()
-        resolved_login_url = resolve_url(self.get_login_url(view_func))
-        # If the login url is the same scheme and net location then use the
-        # path as the "next" url.
-        login_scheme, login_netloc = urlsplit(resolved_login_url)[:2]
-        current_scheme, current_netloc = urlsplit(path)[:2]
-        if (not login_scheme or login_scheme == current_scheme) and (
-            not login_netloc or login_netloc == current_netloc
-        ):
-            path = request.get_full_path()
-
-        return redirect_to_login(
-            path,
-            resolved_login_url,
-            self.get_redirect_field_name(view_func),
+        super().__init__(
+            application=None,
+            autorefresh=autorefresh,
+            max_age=max_age,
+            allow_all_origins=allow_all_origins,
+            charset=charset,
+            mimetypes=mimetypes,
+            add_headers_function=add_headers_function,
+            index_file=index_file,
+            immutable_file_test=immutable_file_test,
         )
 
+        try:
+            self.use_finders = settings.WHITENOISE_USE_FINDERS
+        except AttributeError:
+            self.use_finders = settings.DEBUG
 
-class RemoteUserMiddleware:
-    """
-    Middleware for utilizing web-server-provided authentication.
+        try:
+            self.static_prefix = settings.WHITENOISE_STATIC_PREFIX
+        except AttributeError:
+            self.static_prefix = urlparse(settings.STATIC_URL or "").path
+            if settings.FORCE_SCRIPT_NAME:
+                script_name = settings.FORCE_SCRIPT_NAME.rstrip("/")
+                if self.static_prefix.startswith(script_name):
+                    self.static_prefix = self.static_prefix[len(script_name) :]
+        self.static_prefix = ensure_leading_trailing_slash(self.static_prefix)
 
-    If request.user is not authenticated, then this middleware attempts to
-    authenticate the username from the ``REMOTE_USER`` key in ``request.META``,
-    an environment variable commonly set by the webserver.
+        self.static_root = settings.STATIC_ROOT
+        if self.static_root:
+            self.add_files(self.static_root, prefix=self.static_prefix)
 
-    If authentication is successful, the user is automatically logged in to
-    persist the user in the session.
+        try:
+            root = settings.WHITENOISE_ROOT
+        except AttributeError:
+            root = None
+        if root:
+            self.add_files(root)
 
-    The ``request.META`` key is configurable and defaults to ``REMOTE_USER``.
-    Subclass this class and change the ``header`` attribute if you need to
-    use a different key from ``request.META``, for example a HTTP request
-    header.
-    """
-
-    sync_capable = True
-    async_capable = True
-
-    def __init__(self, get_response):
-        if get_response is None:
-            raise ValueError("get_response must be provided.")
-        self.get_response = get_response
-        self.is_async = iscoroutinefunction(get_response)
-        if self.is_async:
-            markcoroutinefunction(self)
-        super().__init__()
-
-    # Name of request.META key to grab username from. Note that for
-    # request headers, normalization to all uppercase and the addition
-    # of a "HTTP_" prefix apply.
-    header = "REMOTE_USER"
-    force_logout_if_no_header = True
+        if self.use_finders and not self.autorefresh:
+            self.add_files_from_finders()
 
     def __call__(self, request):
-        if self.is_async:
-            return self.__acall__(request)
-        self.process_request(request)
+        if self.autorefresh:
+            static_file = self.find_file(request.path_info)
+        else:
+            static_file = self.files.get(request.path_info)
+        if static_file is not None:
+            return self.serve(static_file, request)
         return self.get_response(request)
 
-    def process_request(self, request):
-        # AuthenticationMiddleware is required so that request.user exists.
-        if not hasattr(request, "user"):
-            raise ImproperlyConfigured(
-                "The Django remote user auth middleware requires the"
-                " authentication middleware to be installed.  Edit your"
-                " MIDDLEWARE setting to insert"
-                " 'django.contrib.auth.middleware.AuthenticationMiddleware'"
-                " before the RemoteUserMiddleware class."
-            )
+    @staticmethod
+    def serve(static_file, request):
+        response = static_file.get_response(request.method, request.META)
+        status = int(response.status)
+        http_response = WhiteNoiseFileResponse(response.file or (), status=status)
+        # Remove default content-type
+        del http_response["content-type"]
+        for key, value in response.headers:
+            http_response[key] = value
+        return http_response
+
+    def add_files_from_finders(self):
+        files = {}
+        for finder in finders.get_finders():
+            for path, storage in finder.list(None):
+                prefix = (getattr(storage, "prefix", None) or "").strip("/")
+                url = "".join(
+                    (
+                        self.static_prefix,
+                        prefix,
+                        "/" if prefix else "",
+                        path.replace("\\", "/"),
+                    )
+                )
+                # Use setdefault as only first matching file should be used
+                files.setdefault(url, storage.path(path))
+        stat_cache = {path: os.stat(path) for path in files.values()}
+        for url, path in files.items():
+            self.add_file_to_dictionary(url, path, stat_cache=stat_cache)
+
+    def candidate_paths_for_url(self, url):
+        if self.use_finders and url.startswith(self.static_prefix):
+            path = finders.find(url[len(self.static_prefix) :])
+            if path:
+                yield path
+        paths = super().candidate_paths_for_url(url)
+        for path in paths:
+            yield path
+
+    def immutable_file_test(self, path, url):
+        """
+        Determine whether given URL represents an immutable file (i.e. a
+        file with a hash of its contents as part of its name) which can
+        therefore be cached forever
+        """
+        if not url.startswith(self.static_prefix):
+            return False
+        name = url[len(self.static_prefix) :]
+        name_without_hash = self.get_name_without_hash(name)
+        if name == name_without_hash:
+            return False
+        static_url = self.get_static_url(name_without_hash)
+        # If the static_url function maps the name without hash
+        # back to the original name, then we know we've got a
+        # versioned filename
+        return bool(static_url and basename(static_url) == basename(url))
+
+    def get_name_without_hash(self, filename):
+        """
+        Removes the version hash from a filename e.g, transforms
+        'css/application.f3ea4bcc2.css' into 'css/application.css'
+
+        Note: this is specific to the naming scheme used by Django's
+        CachedStaticFilesStorage. You may have to override this if
+        you are using a different static files versioning system
+        """
+        name_with_hash, ext = os.path.splitext(filename)
+        name = os.path.splitext(name_with_hash)[0]
+        return name + ext
+
+    def get_static_url(self, name):
         try:
-            username = request.META[self.header]
-        except KeyError:
-            # If specified header doesn't exist then remove any existing
-            # authenticated remote-user, or return (leaving request.user set to
-            # AnonymousUser by the AuthenticationMiddleware).
-            if self.force_logout_if_no_header and request.user.is_authenticated:
-                self._remove_invalid_user(request)
-            return
-        # If the user is already authenticated and that user is the user we are
-        # getting passed in the headers, then the correct user is already
-        # persisted in the session and we don't need to continue.
-        if request.user.is_authenticated:
-            if request.user.get_username() == self.clean_username(username, request):
-                return
-            else:
-                # An authenticated user is associated with the request, but
-                # it does not match the authorized user in the header.
-                self._remove_invalid_user(request)
-
-        # We are seeing this user for the first time in this session, attempt
-        # to authenticate the user.
-        user = auth.authenticate(request, remote_user=username)
-        if user:
-            # User is valid.  Set request.user and persist user in the session
-            # by logging the user in.
-            request.user = user
-            auth.login(request, user)
-
-    async def __acall__(self, request):
-        # RemovedInDjango61Warning.
-        if (
-            self.__class__.process_request is not RemoteUserMiddleware.process_request
-            and self.__class__.aprocess_request is RemoteUserMiddleware.aprocess_request
-        ):
-            warnings.warn(
-                "Support for subclasses of RemoteUserMiddleware that override "
-                "process_request() without overriding aprocess_request() is "
-                "deprecated.",
-                category=RemovedInDjango61Warning,
-                stacklevel=2,
-            )
-            await sync_to_async(self.process_request, thread_sensitive=True)(request)
-            return await self.get_response(request)
-        await self.aprocess_request(request)
-        return await self.get_response(request)
-
-    async def aprocess_request(self, request):
-        # AuthenticationMiddleware is required so that request.user exists.
-        if not hasattr(request, "user"):
-            raise ImproperlyConfigured(
-                "The Django remote user auth middleware requires the"
-                " authentication middleware to be installed.  Edit your"
-                " MIDDLEWARE setting to insert"
-                " 'django.contrib.auth.middleware.AuthenticationMiddleware'"
-                " before the RemoteUserMiddleware class."
-            )
-        try:
-            username = request.META["HTTP_" + self.header]
-        except KeyError:
-            # If specified header doesn't exist then remove any existing
-            # authenticated remote-user, or return (leaving request.user set to
-            # AnonymousUser by the AuthenticationMiddleware).
-            if self.force_logout_if_no_header:
-                user = await request.auser()
-                if user.is_authenticated:
-                    await self._aremove_invalid_user(request)
-            return
-        user = await request.auser()
-        # If the user is already authenticated and that user is the user we are
-        # getting passed in the headers, then the correct user is already
-        # persisted in the session and we don't need to continue.
-        if user.is_authenticated:
-            if user.get_username() == self.clean_username(username, request):
-                return
-            else:
-                # An authenticated user is associated with the request, but
-                # it does not match the authorized user in the header.
-                await self._aremove_invalid_user(request)
-
-        # We are seeing this user for the first time in this session, attempt
-        # to authenticate the user.
-        user = await auth.aauthenticate(request, remote_user=username)
-        if user:
-            # User is valid.  Set request.user and persist user in the session
-            # by logging the user in.
-            request.user = user
-            await auth.alogin(request, user)
-
-    def clean_username(self, username, request):
-        """
-        Allow the backend to clean the username, if the backend defines a
-        clean_username method.
-        """
-        backend_str = request.session[auth.BACKEND_SESSION_KEY]
-        backend = auth.load_backend(backend_str)
-        try:
-            username = backend.clean_username(username)
-        except AttributeError:  # Backend has no clean_username method.
-            pass
-        return username
-
-    def _remove_invalid_user(self, request):
-        """
-        Remove the current authenticated user in the request which is invalid
-        but only if the user is authenticated via the RemoteUserBackend.
-        """
-        try:
-            stored_backend = load_backend(
-                request.session.get(auth.BACKEND_SESSION_KEY, "")
-            )
-        except ImportError:
-            # backend failed to load
-            auth.logout(request)
-        else:
-            if isinstance(stored_backend, RemoteUserBackend):
-                auth.logout(request)
-
-    async def _aremove_invalid_user(self, request):
-        """
-        Remove the current authenticated user in the request which is invalid
-        but only if the user is authenticated via the RemoteUserBackend.
-        """
-        try:
-            stored_backend = load_backend(
-                await request.session.aget(auth.BACKEND_SESSION_KEY, "")
-            )
-        except ImportError:
-            # Backend failed to load.
-            await auth.alogout(request)
-        else:
-            if isinstance(stored_backend, RemoteUserBackend):
-                await auth.alogout(request)
-
-
-class PersistentRemoteUserMiddleware(RemoteUserMiddleware):
-    """
-    Middleware for web-server provided authentication on logon pages.
-
-    Like RemoteUserMiddleware but keeps the user authenticated even if
-    the ``request.META`` key is not found in the request. Useful for
-    setups when the external authentication is only expected to happen
-    on some "logon" URL and the rest of the application wants to use
-    Django's authentication mechanism.
-    """
-
-    force_logout_if_no_header = False
+            return staticfiles_storage.url(name)
+        except ValueError:
+            return None
